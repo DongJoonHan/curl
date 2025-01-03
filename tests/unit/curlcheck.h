@@ -84,7 +84,7 @@
     }                                                                   \
   } while(0)
 
-#define abort_test(msg)                                       \
+#define unittest_abort(msg)                                   \
   do {                                                        \
     fprintf(stderr, "%s:%d test ABORTED: '%s'\n",             \
             __FILE__, __LINE__, msg);                         \
@@ -94,7 +94,7 @@
 
 
 #define UNITTEST_START                          \
-  int test(char *arg)                           \
+  CURLcode test(char *arg)                      \
   {                                             \
     (void)arg;                                  \
     if(unit_setup()) {                          \
@@ -107,5 +107,5 @@
 unit_test_abort:                                \
     unit_stop();                                \
   }                                             \
-  return unitfail;                              \
+  return (CURLcode)unitfail;                    \
   }

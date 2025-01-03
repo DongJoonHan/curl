@@ -11,6 +11,7 @@ See-also:
   - curl_easy_setopt (3)
 Protocol:
   - All
+Added-in: 7.21.0
 ---
 
 # NAME
@@ -35,6 +36,8 @@ If a proxy was used for the most recent transfer, this is the port number of
 the proxy, if no proxy was used it is the port number of the most recently
 accessed URL.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -56,10 +59,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.21.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_getinfo(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

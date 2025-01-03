@@ -71,15 +71,14 @@
 #include <netdb.h>
 #endif
 
-#define ENABLE_CURLX_PRINTF
-/* make the curlx header define all printf() functions to use the curlx_*
-   versions instead */
 #include "curlx.h" /* from the private lib dir */
 #include "getpart.h"
 #include "inet_pton.h"
 #include "util.h"
 #include "server_sockaddr.h"
 #include "warnless.h"
+
+#include "tool_binmode.h"
 
 /* include memdebug.h last */
 #include "memdebug.h"
@@ -176,7 +175,7 @@ static unsigned short shortval(char *value)
 
 static enum {
   socket_domain_inet = AF_INET
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
   , socket_domain_inet6 = AF_INET6
 #endif
 #ifdef USE_UNIX_SOCKETS
@@ -251,7 +250,7 @@ static void loghex(unsigned char *buffer, ssize_t len)
   ssize_t width = 0;
   int left = sizeof(data);
 
-  for(i = 0; i<len && (left >= 0); i++) {
+  for(i = 0; i < len && (left >= 0); i++) {
     msnprintf(optr, left, "%02x", ptr[i]);
     width += 2;
     optr += 2;
@@ -327,7 +326,7 @@ static curl_socket_t socks4(curl_socket_t fd,
     return CURL_SOCKET_BAD;
   }
   if(!config.port)
-    s4port = (unsigned short)((buffer[SOCKS4_DSTPORT]<<8) |
+    s4port = (unsigned short)((buffer[SOCKS4_DSTPORT] << 8) |
                               (buffer[SOCKS4_DSTPORT + 1]));
   else
     s4port = config.port;
@@ -575,7 +574,7 @@ static curl_socket_t sockit(curl_socket_t fd)
 
   if(!config.port) {
     unsigned char *portp = &buffer[SOCKS5_DSTADDR + len];
-    s5port = (unsigned short)((portp[0]<<8) | (portp[1]));
+    s5port = (unsigned short)((portp[0] << 8) | (portp[1]));
   }
   else
     s5port = config.port;
@@ -620,7 +619,7 @@ static curl_socket_t sockit(curl_socket_t fd)
   memcpy(&response[SOCKS5_BNDADDR + len],
          &buffer[SOCKS5_DSTADDR + len], sizeof(socksport));
 
-  rc = (send)(fd, (char *)response, (size_t)(len + 6), 0);
+  rc = (send)(fd, (char *)response, (SEND_TYPE_ARG3)(len + 6), 0);
   if(rc != (len + 6)) {
     logmsg("Sending connect response failed!");
     return CURL_SOCKET_BAD;
@@ -720,16 +719,37 @@ static bool incoming(curl_socket_t listenfd)
     FD_ZERO(&fds_err);
 
     /* there's always a socket to wait for */
+#if defined(__DJGPP__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warith-conversion"
+#endif
     FD_SET(sockfd, &fds_read);
+#if defined(__DJGPP__)
+#pragma GCC diagnostic pop
+#endif
 
     for(i = 0; i < 2; i++) {
       if(c[i].used) {
         curl_socket_t fd = c[i].clientfd;
+#if defined(__DJGPP__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warith-conversion"
+#endif
         FD_SET(fd, &fds_read);
+#if defined(__DJGPP__)
+#pragma GCC diagnostic pop
+#endif
         if((int)fd > maxfd)
           maxfd = (int)fd;
         fd = c[i].remotefd;
+#if defined(__DJGPP__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warith-conversion"
+#endif
         FD_SET(fd, &fds_read);
+#if defined(__DJGPP__)
+#pragma GCC diagnostic pop
+#endif
         if((int)fd > maxfd)
           maxfd = (int)fd;
       }
@@ -754,13 +774,13 @@ static bool incoming(curl_socket_t listenfd)
       curl_socket_t newfd = accept(sockfd, NULL, NULL);
       if(CURL_SOCKET_BAD == newfd) {
         error = SOCKERRNO;
-        logmsg("accept(%" CURL_FORMAT_SOCKET_T ", NULL, NULL) "
+        logmsg("accept(%" FMT_SOCKET_T ", NULL, NULL) "
                "failed with error: (%d) %s",
                sockfd, error, sstrerror(error));
       }
       else {
         curl_socket_t remotefd;
-        logmsg("====> Client connect, fd %" CURL_FORMAT_SOCKET_T ". "
+        logmsg("====> Client connect, fd %" FMT_SOCKET_T ". "
                "Read config from %s", newfd, configfile);
         remotefd = sockit(newfd); /* SOCKS until done */
         if(remotefd == CURL_SOCKET_BAD) {
@@ -865,7 +885,7 @@ static curl_socket_t sockdaemon(curl_socket_t sock,
       listener.sa4.sin_port = htons(*listenport);
       rc = bind(sock, &listener.sa, sizeof(listener.sa4));
       break;
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
     case AF_INET6:
       memset(&listener.sa6, 0, sizeof(listener.sa6));
       listener.sa6.sin6_family = AF_INET6;
@@ -873,7 +893,7 @@ static curl_socket_t sockdaemon(curl_socket_t sock,
       listener.sa6.sin6_port = htons(*listenport);
       rc = bind(sock, &listener.sa, sizeof(listener.sa6));
       break;
-#endif /* ENABLE_IPV6 */
+#endif /* USE_IPV6 */
 #ifdef USE_UNIX_SOCKETS
     case AF_UNIX:
     rc = bind_unix_socket(sock, unix_socket, &listener.sau);
@@ -903,7 +923,7 @@ static curl_socket_t sockdaemon(curl_socket_t sock,
        port we actually got and update the listener port value with it. */
     curl_socklen_t la_size;
     srvr_sockaddr_union_t localaddr;
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
     if(socket_domain == AF_INET6)
       la_size = sizeof(localaddr.sa6);
     else
@@ -921,7 +941,7 @@ static curl_socket_t sockdaemon(curl_socket_t sock,
     case AF_INET:
       *listenport = ntohs(localaddr.sa4.sin_port);
       break;
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
     case AF_INET6:
       *listenport = ntohs(localaddr.sa6.sin6_port);
       break;
@@ -944,7 +964,7 @@ static curl_socket_t sockdaemon(curl_socket_t sock,
   rc = listen(sock, 5);
   if(0 != rc) {
     error = SOCKERRNO;
-    logmsg("listen(%" CURL_FORMAT_SOCKET_T ", 5) failed with error: (%d) %s",
+    logmsg("listen(%" FMT_SOCKET_T ", 5) failed with error: (%d) %s",
            sock, error, sstrerror(error));
     sclose(sock);
     return CURL_SOCKET_BAD;
@@ -971,10 +991,10 @@ int main(int argc, char *argv[])
   bool unlink_socket = false;
 #endif
 
-  while(argc>arg) {
+  while(argc > arg) {
     if(!strcmp("--version", argv[arg])) {
       printf("socksd IPv4%s\n",
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
              "/IPv6"
 #else
              ""
@@ -984,41 +1004,41 @@ int main(int argc, char *argv[])
     }
     else if(!strcmp("--pidfile", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         pidname = argv[arg++];
     }
     else if(!strcmp("--portfile", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         portname = argv[arg++];
     }
     else if(!strcmp("--config", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         configfile = argv[arg++];
     }
     else if(!strcmp("--backend", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         backendaddr = argv[arg++];
     }
     else if(!strcmp("--backendport", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         backendport = (unsigned short)atoi(argv[arg++]);
     }
     else if(!strcmp("--logfile", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         serverlogfile = argv[arg++];
     }
     else if(!strcmp("--reqfile", argv[arg])) {
       arg++;
-      if(argc>arg)
+      if(argc > arg)
         reqlogfile = argv[arg++];
     }
     else if(!strcmp("--ipv6", argv[arg])) {
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
       socket_domain = AF_INET6;
       socket_type = "IPv6";
 #endif
@@ -1026,14 +1046,14 @@ int main(int argc, char *argv[])
     }
     else if(!strcmp("--ipv4", argv[arg])) {
       /* for completeness, we support this option as well */
-#ifdef ENABLE_IPV6
+#ifdef USE_IPV6
       socket_type = "IPv4";
 #endif
       arg++;
     }
     else if(!strcmp("--unix-socket", argv[arg])) {
       arg++;
-      if(argc>arg) {
+      if(argc > arg) {
 #ifdef USE_UNIX_SOCKETS
         struct sockaddr_un sau;
         unix_socket = argv[arg];
@@ -1051,7 +1071,7 @@ int main(int argc, char *argv[])
     }
     else if(!strcmp("--port", argv[arg])) {
       arg++;
-      if(argc>arg) {
+      if(argc > arg) {
         char *endptr;
         unsigned long ulnum = strtoul(argv[arg], &endptr, 10);
         port = curlx_ultous(ulnum);
@@ -1080,11 +1100,11 @@ int main(int argc, char *argv[])
 #ifdef _WIN32
   win32_init();
   atexit(win32_cleanup);
-
-  setmode(fileno(stdin), O_BINARY);
-  setmode(fileno(stdout), O_BINARY);
-  setmode(fileno(stderr), O_BINARY);
 #endif
+
+  CURL_SET_BINMODE(stdin);
+  CURL_SET_BINMODE(stdout);
+  CURL_SET_BINMODE(stderr);
 
   install_signal_handlers(false);
 
@@ -1117,7 +1137,7 @@ int main(int argc, char *argv[])
 
 #ifdef USE_UNIX_SOCKETS
   if(socket_domain == AF_UNIX)
-    logmsg("Listening on unix socket %s", unix_socket);
+    logmsg("Listening on Unix socket %s", unix_socket);
   else
 #endif
   logmsg("Listening on port %hu", port);
@@ -1147,7 +1167,7 @@ socks5_cleanup:
     sclose(sock);
 
 #ifdef USE_UNIX_SOCKETS
-  if(unlink_socket && socket_domain == AF_UNIX) {
+  if(unlink_socket && socket_domain == AF_UNIX && unix_socket) {
     error = unlink(unix_socket);
     logmsg("unlink(%s) = %d (%s)", unix_socket, error, strerror(error));
   }

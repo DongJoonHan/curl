@@ -11,6 +11,7 @@ See-also:
   - CURLOPT_INTERFACE (3)
 Protocol:
   - All
+Added-in: 7.33.0
 ---
 
 # NAME
@@ -35,9 +36,14 @@ specific interface).
 The application does not have to keep the string around after setting this
 option.
 
+Using this option multiple times makes the last set string override the
+previous ones. Set it to NULL to disable its use again.
+
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -55,13 +61,16 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
+# NOTES
 
-Added in 7.33.0. This option also requires that libcurl was built with a
-resolver backend that supports this operation. The c-ares backend is the only
-such one.
+This option requires that libcurl was built with a resolver backend that
+supports this operation. The c-ares backend is the only such one.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, CURLE_UNKNOWN_OPTION if not,
-or CURLE_NOT_BUILT_IN if support was disabled at compile-time.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

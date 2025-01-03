@@ -30,8 +30,6 @@
 
 #include <sys/stat.h>
 
-#define ENABLE_CURLX_PRINTF
-/* use our own printf() functions */
 #include "curlx.h"
 
 #include "tool_cfgable.h"
@@ -41,9 +39,6 @@
 
 #include "memdebug.h" /* keep this as LAST include */
 
-#ifndef O_BINARY
-#define O_BINARY 0
-#endif
 #ifdef _WIN32
 #define OPENMODE S_IREAD | S_IWRITE
 #else
@@ -56,14 +51,11 @@ bool tool_create_output_file(struct OutStruct *outs,
 {
   struct GlobalConfig *global;
   FILE *file = NULL;
-  char *fname = outs->filename;
+  const char *fname = outs->filename;
   DEBUGASSERT(outs);
   DEBUGASSERT(config);
   global = config->global;
-  if(!fname || !*fname) {
-    warnf(global, "Remote filename has no length");
-    return FALSE;
-  }
+  DEBUGASSERT(fname && *fname);
 
   if(config->file_clobber_mode == CLOBBER_ALWAYS ||
      (config->file_clobber_mode == CLOBBER_DEFAULT &&
@@ -74,8 +66,8 @@ bool tool_create_output_file(struct OutStruct *outs,
   else {
     int fd;
     do {
-      fd = open(fname, O_CREAT | O_WRONLY | O_EXCL | O_BINARY, OPENMODE);
-      /* Keep retrying in the hope that it isn't interrupted sometime */
+      fd = open(fname, O_CREAT | O_WRONLY | O_EXCL | CURL_O_BINARY, OPENMODE);
+      /* Keep retrying in the hope that it is not interrupted sometime */
     } while(fd == -1 && errno == EINTR);
     if(config->file_clobber_mode == CLOBBER_NEVER && fd == -1) {
       int next_num = 1;
@@ -94,15 +86,16 @@ bool tool_create_output_file(struct OutStruct *outs,
       }
       memcpy(newname, fname, len);
       newname[len] = '.';
-      while(fd == -1 && /* haven't successfully opened a file */
+      while(fd == -1 && /* have not successfully opened a file */
             (errno == EEXIST || errno == EISDIR) &&
             /* because we keep having files that already exist */
-            next_num < 100 /* and we haven't reached the retry limit */ ) {
-        curlx_msnprintf(newname + len + 1, 12, "%d", next_num);
+            next_num < 100 /* and we have not reached the retry limit */ ) {
+        msnprintf(newname + len + 1, 12, "%d", next_num);
         next_num++;
         do {
-          fd = open(newname, O_CREAT | O_WRONLY | O_EXCL | O_BINARY, OPENMODE);
-          /* Keep retrying in the hope that it isn't interrupted sometime */
+          fd = open(newname, O_CREAT | O_WRONLY | O_EXCL | CURL_O_BINARY,
+                             OPENMODE);
+          /* Keep retrying in the hope that it is not interrupted sometime */
         } while(fd == -1 && errno == EINTR);
       }
       outs->filename = newname; /* remember the new one */
@@ -152,7 +145,7 @@ size_t tool_write_cb(char *buffer, size_t sz, size_t nmemb, void *userdata)
 
 #ifdef DEBUGBUILD
   {
-    char *tty = curlx_getenv("CURL_ISATTY");
+    char *tty = curl_getenv("CURL_ISATTY");
     if(tty) {
       is_tty = TRUE;
       curl_free(tty);
@@ -219,7 +212,7 @@ size_t tool_write_cb(char *buffer, size_t sz, size_t nmemb, void *userdata)
 
 #ifdef _WIN32
   fhnd = _get_osfhandle(fileno(outs->stream));
-  /* if windows console then UTF-8 must be converted to UTF-16 */
+  /* if Windows console then UTF-8 must be converted to UTF-16 */
   if(isatty(fileno(outs->stream)) &&
      GetConsoleScreenBufferInfo((HANDLE)fhnd, &console_info)) {
     wchar_t *wc_buf;
@@ -318,7 +311,8 @@ size_t tool_write_cb(char *buffer, size_t sz, size_t nmemb, void *userdata)
 
     if(rlen) {
       /* calculate buffer size for wide characters */
-      wc_len = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)rbuf, rlen, NULL, 0);
+      wc_len = (DWORD)MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)rbuf, (int)rlen,
+                                          NULL, 0);
       if(!wc_len)
         return CURL_WRITEFUNC_ERROR;
 
@@ -326,8 +320,8 @@ size_t tool_write_cb(char *buffer, size_t sz, size_t nmemb, void *userdata)
       if(!wc_buf)
         return CURL_WRITEFUNC_ERROR;
 
-      wc_len = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)rbuf, rlen, wc_buf,
-                                   wc_len);
+      wc_len = (DWORD)MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)rbuf, (int)rlen,
+                                          wc_buf, (int)wc_len);
       if(!wc_len) {
         free(wc_buf);
         return CURL_WRITEFUNC_ERROR;
@@ -349,7 +343,13 @@ size_t tool_write_cb(char *buffer, size_t sz, size_t nmemb, void *userdata)
   }
   else
 #endif
+  {
+    if(per->hdrcbdata.headlist) {
+      if(tool_write_headers(&per->hdrcbdata, outs->stream))
+        return CURL_WRITEFUNC_ERROR;
+    }
     rc = fwrite(buffer, sz, nmemb, outs->stream);
+  }
 
   if(bytes == rc)
     /* we added this amount of data to the output */

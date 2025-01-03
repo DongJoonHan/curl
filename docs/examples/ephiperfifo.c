@@ -33,7 +33,7 @@
  *
  * Written by Jeff Pohlmeyer, converted to use epoll by Josh Bialkowski
 
-Requires a linux system with epoll
+Requires a Linux system with epoll
 
 When running, the program creates the named pipe "hiper.fifo"
 
@@ -354,13 +354,13 @@ static int prog_cb(void *p, double dltotal, double dlnow, double ult,
 
 
 /* Create a new easy handle, and add it to the global curl_multi */
-static void new_conn(char *url, GlobalInfo *g)
+static void new_conn(const char *url, GlobalInfo *g)
 {
   ConnInfo *conn;
   CURLMcode rc;
 
   conn = (ConnInfo*)calloc(1, sizeof(ConnInfo));
-  conn->error[0]='\0';
+  conn->error[0] = '\0';
 
   conn->easy = curl_easy_init();
   if(!conn->easy) {

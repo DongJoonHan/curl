@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_XFERINFOFUNCTION (3)
 Protocol:
   - All
+Added-in: 7.32.0
 ---
 
 # NAME
@@ -33,7 +34,9 @@ This is an alias for CURLOPT_PROGRESSDATA(3).
 
 # DEFAULT
 
-The default value of this parameter is NULL.
+NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -69,10 +72,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.32.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

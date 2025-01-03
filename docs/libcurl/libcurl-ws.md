@@ -1,7 +1,7 @@
 ---
 c: Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
 SPDX-License-Identifier: curl
-Title: libcurl
+Title: libcurl-ws
 Section: 3
 Source: libcurl
 See-also:
@@ -14,6 +14,7 @@ See-also:
   - curl_ws_send (3)
 Protocol:
   - All
+Added-in: 7.86.0
 ---
 
 # NAME
@@ -114,12 +115,3 @@ back to the application.
 Once such a setup has been successfully performed, the application can proceed
 and use curl_ws_recv(3) and curl_ws_send(3) freely to exchange
 WebSocket messages with the server.
-
-# AVAILABILITY
-
-The WebSocket API was introduced as experimental in 7.86.0 and is still
-experimental today.
-
-It is only built-in if explicitly opted in at build time. We discourage use of
-the WebSocket API in production because of its experimental state. We might
-change API, ABI and behavior before this "goes live".

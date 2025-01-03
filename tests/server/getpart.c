@@ -25,15 +25,7 @@
 
 #include "getpart.h"
 
-#define ENABLE_CURLX_PRINTF
-/* make the curlx header define all printf() functions to use the curlx_*
-   versions instead */
 #include "curlx.h" /* from the private lib dir */
-
-/* just to please curl_base64.h we create a fake struct */
-struct Curl_easy {
-  int fake;
-};
 
 #include "curl_base64.h"
 #include "curl_memory.h"
@@ -52,6 +44,7 @@ struct Curl_easy {
 #endif
 
 #if defined(_MSC_VER) && defined(_DLL)
+#  pragma warning(push)
 #  pragma warning(disable:4232) /* MSVC extension, dllimport identity */
 #endif
 
@@ -65,37 +58,9 @@ curl_wcsdup_callback Curl_cwcsdup = (curl_wcsdup_callback)_wcsdup;
 #endif
 
 #if defined(_MSC_VER) && defined(_DLL)
-#  pragma warning(default:4232) /* MSVC extension, dllimport identity */
+#  pragma warning(pop)
 #endif
 
-
-/*
- * Curl_convert_clone() returns a malloced copy of the source string (if
- * returning CURLE_OK), with the data converted to network format. This
- * function is used by base64 code in libcurl built to support data
- * conversion. This is a DUMMY VERSION that returns data unmodified - for
- * use by the test server only.
- */
-CURLcode Curl_convert_clone(struct Curl_easy *data,
-                            const char *indata,
-                            size_t insize,
-                            char **outbuf);
-CURLcode Curl_convert_clone(struct Curl_easy *data,
-                            const char *indata,
-                            size_t insize,
-                            char **outbuf)
-{
-  char *convbuf;
-  (void)data;
-
-  convbuf = malloc(insize);
-  if(!convbuf)
-    return CURLE_OUT_OF_MEMORY;
-
-  memcpy(convbuf, indata, insize);
-  *outbuf = convbuf;
-  return CURLE_OK;
-}
 
 /*
  * line_length()
@@ -384,9 +349,6 @@ int getpart(char **outbuf, size_t *outlen,
         state = STATE_INMAIN;
         csub[0] = '\0';
         if(in_wanted_part) {
-          /* end of wanted part */
-          in_wanted_part = 0;
-
           /* Do we need to base64 decode the data? */
           if(base64) {
             error = decodedata(outbuf, outlen);
@@ -403,9 +365,6 @@ int getpart(char **outbuf, size_t *outlen,
         state = STATE_OUTER;
         cmain[0] = '\0';
         if(in_wanted_part) {
-          /* end of wanted part */
-          in_wanted_part = 0;
-
           /* Do we need to base64 decode the data? */
           if(base64) {
             error = decodedata(outbuf, outlen);
@@ -421,11 +380,8 @@ int getpart(char **outbuf, size_t *outlen,
         /* end of outermost file section */
         state = STATE_OUTSIDE;
         couter[0] = '\0';
-        if(in_wanted_part) {
-          /* end of wanted part */
-          in_wanted_part = 0;
+        if(in_wanted_part)
           break;
-        }
       }
 
     }

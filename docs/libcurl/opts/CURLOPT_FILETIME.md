@@ -13,6 +13,7 @@ Protocol:
   - SFTP
   - FILE
   - SMB
+Added-in: 7.5
 ---
 
 # NAME
@@ -38,6 +39,8 @@ transfer to extract the received time (if any).
 # DEFAULT
 
 0
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -65,10 +68,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Always, for SFTP since 7.49.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

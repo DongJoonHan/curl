@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_LOCALPORTRANGE (3)
 Protocol:
   - All
+Added-in: 7.15.2
 ---
 
 # NAME
@@ -35,6 +36,8 @@ this option is set. Valid port numbers are 1 - 65535.
 
 0, disabled - use whatever the system thinks is fine
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -53,10 +56,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.15.2
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

@@ -11,6 +11,7 @@ See-also:
   - CURLOPT_REQUEST_TARGET (3)
 Protocol:
   - HTTP
+Added-in: 7.1
 ---
 
 # NAME
@@ -34,9 +35,14 @@ can also set any custom header with CURLOPT_HTTPHEADER(3).
 The application does not have to keep the string around after setting this
 option.
 
+Using this option multiple times makes the last set string override the
+previous ones. Set it to NULL to disable its use again.
+
 # DEFAULT
 
-NULL, no User-Agent: header is used by default.
+NULL, no User-Agent: header is used.
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -54,11 +60,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-As long as HTTP is supported
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if HTTP is supported, CURLE_UNKNOWN_OPTION if not, or
-CURLE_OUT_OF_MEMORY if there was insufficient heap space.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

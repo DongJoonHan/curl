@@ -10,6 +10,7 @@ See-also:
   - curl_multi_init (3)
 Protocol:
   - All
+Added-in: 7.9.6
 ---
 
 # NAME
@@ -46,6 +47,8 @@ libcurl keeps the connection alive in the connection pool associated with the
 multi handle, ready to get reused for a future transfer using this multi
 handle.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -66,10 +69,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.9.6
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-CURLMcode type, general libcurl multi interface error code.
+This function returns a CURLMcode indicating success or error.
+
+CURLM_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

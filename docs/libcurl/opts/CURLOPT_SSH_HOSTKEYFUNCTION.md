@@ -10,6 +10,7 @@ See-also:
 Protocol:
   - SFTP
   - SCP
+Added-in: 7.84.0
 ---
 
 # NAME
@@ -58,6 +59,8 @@ the host key is rejected, the connection is canceled.
 
 NULL
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -88,10 +91,15 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
+# NOTES
 
-Added in 7.84.0 , work only with libssh2 backend.
+Work only with the libssh2 backend.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

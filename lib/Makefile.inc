@@ -44,6 +44,7 @@ LIB_VAUTH_HFILES =      \
 
 LIB_VTLS_CFILES =           \
   vtls/bearssl.c            \
+  vtls/cipher_suite.c       \
   vtls/gtls.c               \
   vtls/hostcheck.c          \
   vtls/keylog.c             \
@@ -55,11 +56,13 @@ LIB_VTLS_CFILES =           \
   vtls/schannel_verify.c    \
   vtls/sectransp.c          \
   vtls/vtls.c               \
+  vtls/vtls_scache.c        \
   vtls/wolfssl.c            \
   vtls/x509asn1.c
 
 LIB_VTLS_HFILES =           \
   vtls/bearssl.h            \
+  vtls/cipher_suite.h       \
   vtls/gtls.h               \
   vtls/hostcheck.h          \
   vtls/keylog.h             \
@@ -72,6 +75,7 @@ LIB_VTLS_HFILES =           \
   vtls/sectransp.h          \
   vtls/vtls.h               \
   vtls/vtls_int.h           \
+  vtls/vtls_scache.h        \
   vtls/wolfssl.h            \
   vtls/x509asn1.h
 
@@ -95,9 +99,11 @@ LIB_VQUIC_HFILES = \
 LIB_VSSH_CFILES =  \
   vssh/libssh.c    \
   vssh/libssh2.c   \
+  vssh/curl_path.c \
   vssh/wolfssh.c
 
-LIB_VSSH_HFILES =  \
+LIB_VSSH_HFILES =    \
+  vssh/curl_path.h   \
   vssh/ssh.h
 
 LIB_CFILES =         \
@@ -108,7 +114,6 @@ LIB_CFILES =         \
   base64.c           \
   bufq.c             \
   bufref.c           \
-  c-hyper.c          \
   cf-h1-proxy.c      \
   cf-h2-proxy.c      \
   cf-haproxy.c       \
@@ -129,8 +134,6 @@ LIB_CFILES =         \
   curl_memrchr.c     \
   curl_multibyte.c   \
   curl_ntlm_core.c   \
-  curl_ntlm_wb.c     \
-  curl_path.c        \
   curl_range.c       \
   curl_rtmp.c        \
   curl_sasl.c        \
@@ -140,6 +143,7 @@ LIB_CFILES =         \
   curl_trc.c         \
   cw-out.c           \
   dict.c             \
+  dllmain.c          \
   doh.c              \
   dynbuf.c           \
   dynhds.c           \
@@ -220,6 +224,7 @@ LIB_CFILES =         \
   strcase.c          \
   strdup.c           \
   strerror.c         \
+  strparse.c         \
   strtok.c           \
   strtoofft.c        \
   system_win32.c     \
@@ -242,7 +247,6 @@ LIB_HFILES =         \
   asyn.h             \
   bufq.h             \
   bufref.h           \
-  c-hyper.h          \
   cf-h1-proxy.h      \
   cf-h2-proxy.h      \
   cf-haproxy.h       \
@@ -271,8 +275,6 @@ LIB_HFILES =         \
   curl_memrchr.h     \
   curl_multibyte.h   \
   curl_ntlm_core.h   \
-  curl_ntlm_wb.h     \
-  curl_path.h        \
   curl_printf.h      \
   curl_range.h       \
   curl_rtmp.h        \
@@ -357,6 +359,7 @@ LIB_HFILES =         \
   strcase.h          \
   strdup.h           \
   strerror.h         \
+  strparse.h         \
   strtok.h           \
   strtoofft.h        \
   system_win32.h     \

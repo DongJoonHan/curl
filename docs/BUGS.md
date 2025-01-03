@@ -1,8 +1,14 @@
+<!--
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+
+SPDX-License-Identifier: curl
+-->
+
 # BUGS
 
 ## There are still bugs
 
- Curl and libcurl keep being developed. Adding features and changing code
+ curl and libcurl keep being developed. Adding features and changing code
  means that bugs sneak in, no matter how hard we try to keep them out.
 
  Of course there are lots of bugs left. Not to mention misfeatures.
@@ -19,8 +25,8 @@
 
  Please read the rest of this document below first before doing that.
 
- If you feel you need to ask around first, find a suitable [mailing list](
- https://curl.se/mail/) and post your questions there.
+ If you feel you need to ask around first, find a suitable [mailing
+ list](https://curl.se/mail/) and post your questions there.
 
 ## Security bugs
 

@@ -9,6 +9,7 @@ Protocol:
 See-also:
   - CURLOPT_IOCTLDATA (3)
   - CURLOPT_SEEKFUNCTION (3)
+Added-in: 7.12.3
 ---
 
 # NAME
@@ -56,12 +57,14 @@ The *clientp* argument to the callback is set with the
 CURLOPT_IOCTLDATA(3) option.
 
 **This option is deprecated**. Do not use it. Use CURLOPT_SEEKFUNCTION(3)
-instead to provide seeking! If CURLOPT_SEEKFUNCTION(3) is set, this
+instead to provide seeking. If CURLOPT_SEEKFUNCTION(3) is set, this
 parameter is ignored when seeking.
 
 # DEFAULT
 
-By default, this parameter is set to NULL. Not used.
+NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -92,10 +95,15 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
+# DEPRECATED
 
-Added in 7.12.3. Deprecated since 7.18.0.
+Deprecated since 7.18.0.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

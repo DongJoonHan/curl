@@ -9,6 +9,7 @@ See-also:
   - CURLOPT_STDERR (3)
 Protocol:
   - All
+Added-in: 7.19.0
 ---
 
 # NAME
@@ -31,6 +32,8 @@ Pass a long specifying the scope id value to use when connecting to IPv6 address
 
 0
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -51,11 +54,12 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.19.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).
 Returns CURLE_BAD_FUNCTION_ARGUMENT if set to a negative value.

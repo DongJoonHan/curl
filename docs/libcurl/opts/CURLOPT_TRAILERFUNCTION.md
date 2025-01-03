@@ -9,6 +9,7 @@ See-also:
   - CURLOPT_WRITEFUNCTION (3)
 Protocol:
   - HTTP
+Added-in: 7.64.0
 ---
 
 # NAME
@@ -59,6 +60,8 @@ without any interruptions.
 
 NULL
 
+# %PROTOCOLS%
+
 # EXAMPLE
 ~~~c
 static int trailer_cb(struct curl_slist **tr, void *data)
@@ -77,7 +80,7 @@ int main(void)
     /* Set the URL of the request */
     curl_easy_setopt(curl, CURLOPT_URL, "https://example.com/");
     /* Now set it as a put */
-    curl_easy_setopt(curl, CURLOPT_PUT, 1L);
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
 
     /* Assuming we have a function that returns the data to be pushed
        Let that function be read_cb */
@@ -99,10 +102,12 @@ int main(void)
   }
 }
 ~~~
-# AVAILABILITY
 
-This option was added in curl 7.64.0 and is present if HTTP support is enabled.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

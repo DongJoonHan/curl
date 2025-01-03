@@ -13,6 +13,7 @@ Protocol:
 TLS-backend:
   - OpenSSL
   - GnuTLS
+Added-in: 7.76.0
 ---
 
 # NAME
@@ -46,6 +47,8 @@ the verification fails.
 
 0
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -66,11 +69,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.76.0.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if OCSP stapling is supported by the SSL backend, otherwise
-returns CURLE_NOT_BUILT_IN.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

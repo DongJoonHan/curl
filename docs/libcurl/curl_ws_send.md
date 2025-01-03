@@ -12,6 +12,7 @@ See-also:
   - libcurl-ws (3)
 Protocol:
   - WS
+Added-in: 7.86.0
 ---
 
 # NAME
@@ -29,8 +30,6 @@ CURLcode curl_ws_send(CURL *curl, const void *buffer, size_t buflen,
 ~~~
 
 # DESCRIPTION
-
-This function call is EXPERIMENTAL.
 
 Send the specific message fragment over an established WebSocket
 connection. The *buffer* holds the data to send and it is *buflen*
@@ -51,6 +50,10 @@ If **CURLWS_RAW_MODE** is enabled in CURLOPT_WS_OPTIONS(3), the
 
 To send a message consisting of multiple frames, set the *CURLWS_CONT* bit
 in all frames except the final one.
+
+Warning: while it is possible to invoke this function from a callback,
+such a call is blocking in this situation, e.g. only returns after all data
+has been sent or an error is encountered.
 
 # FLAGS
 
@@ -89,6 +92,8 @@ fragment like this, the *fragsize* must be provided with the total
 expected fragment size in the first call and it needs to be zero in subsequent
 calls.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -111,12 +116,13 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.86.0.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-*CURLE_OK* (zero) means that the data was sent properly, non-zero means an
-error occurred as *\<curl/curl.h\>* defines. See the libcurl-errors(3) man
-page for the full list with descriptions.
+This function returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3). If CURLOPT_ERRORBUFFER(3) was set with curl_easy_setopt(3)
+there can be an error message stored in the error buffer when non-zero is
+returned.

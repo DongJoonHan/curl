@@ -6,6 +6,7 @@ Section: 1
 Source: curl-config
 See-also:
   - curl (1)
+Added-in: 7.7.2
 ---
 
 # NAME
@@ -65,7 +66,7 @@ link your application with libcurl.
 
 ## --prefix
 
-This is the prefix used when libcurl was installed. Libcurl is then installed
+This is the prefix used when libcurl was installed. libcurl is then installed
 in $prefix/lib and its header files are installed in $prefix/include and so
 on. The prefix is set with "configure --prefix".
 

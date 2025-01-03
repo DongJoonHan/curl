@@ -12,6 +12,7 @@ See-also:
   - CURLOPT_PROXYUSERPWD (3)
 Protocol:
   - All
+Added-in: 7.10.7
 ---
 
 # NAME
@@ -43,6 +44,8 @@ CURLOPT_HTTPAUTH(3) man page.
 
 CURLAUTH_BASIC
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -64,12 +67,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.10.7
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, CURLE_UNKNOWN_OPTION if not, or
-CURLE_NOT_BUILT_IN if the bitmask specified no supported authentication
-methods.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

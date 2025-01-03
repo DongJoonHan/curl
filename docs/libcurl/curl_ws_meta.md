@@ -12,6 +12,7 @@ See-also:
   - libcurl-ws (3)
 Protocol:
   - WS
+Added-in: 7.86.0
 ---
 
 # NAME
@@ -27,8 +28,6 @@ const struct curl_ws_frame *curl_ws_meta(CURL *curl);
 ~~~
 
 # DESCRIPTION
-
-This function call is EXPERIMENTAL.
 
 When the write callback (CURLOPT_WRITEFUNCTION(3)) is invoked on
 received WebSocket traffic, curl_ws_meta(3) can be called from within
@@ -97,6 +96,8 @@ This transfer is now closed.
 
 This as an incoming ping message, that expects a pong response.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -132,9 +133,7 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.86.0.
+# %AVAILABILITY%
 
 # RETURN VALUE
 

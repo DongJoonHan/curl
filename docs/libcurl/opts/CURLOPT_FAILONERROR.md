@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_KEEP_SENDING_ON_ERROR (3)
 Protocol:
   - HTTP
+Added-in: 7.1
 ---
 
 # NAME
@@ -45,6 +46,8 @@ get closed and *CURLE_HTTP_RETURNED_ERROR* is returned.
 
 0, do not fail on error
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -63,10 +66,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Along with HTTP.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if HTTP is enabled, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

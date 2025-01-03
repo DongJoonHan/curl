@@ -1,4 +1,10 @@
-# how to install curl and libcurl
+<!--
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+
+SPDX-License-Identifier: curl
+-->
+
+# How to install curl and libcurl
 
 ## Installing Binary Packages
 
@@ -134,7 +140,7 @@ These options are provided to select the TLS backend to use.
  - BearSSL: `--with-bearssl`
  - GnuTLS: `--with-gnutls`.
  - mbedTLS: `--with-mbedtls`
- - OpenSSL: `--with-openssl` (also for BoringSSL, AWS-LC, libressl, and quictls)
+ - OpenSSL: `--with-openssl` (also for BoringSSL, AWS-LC, LibreSSL, and quictls)
  - rustls: `--with-rustls`
  - Schannel: `--with-schannel`
  - Secure Transport: `--with-secure-transport`
@@ -148,7 +154,17 @@ conflicting identical symbol names.
 When you build with multiple TLS backends, you can select the active one at
 runtime when curl starts up.
 
-## configure finding libs in wrong directory
+## MultiSSL and HTTP/3
+
+HTTP/3 needs QUIC and QUIC needs TLS. Building libcurl with HTTP/3 and QUIC
+support is not compatible with the MultiSSL feature: they are mutually
+exclusive. If you need MultiSSL in your build, you cannot have HTTP/3 support
+and vice versa.
+
+libcurl can only use a single TLS library with QUIC and that *same* TLS
+library needs to be used for the other TLS using protocols.
+
+## Configure finding libs in wrong directory
 
 When the configure script checks for third-party libraries, it adds those
 directories to the `LDFLAGS` variable and then tries linking to see if it
@@ -195,17 +211,34 @@ Run `make`
 
 ## MS-DOS
 
-Requires DJGPP in the search path and pointing to the Watt-32 stack via
-`WATT_PATH=c:/djgpp/net/watt`.
+You can use either autotools or cmake:
 
-Run `make -f Makefile.dist djgpp` in the root curl dir.
+    ./configure \
+      CC=/path/to/djgpp/bin/i586-pc-msdosdjgpp-gcc \
+      AR=/path/to/djgpp/bin/i586-pc-msdosdjgpp-ar \
+      RANLIB=/path/to/djgpp/bin/i586-pc-msdosdjgpp-ranlib \
+      WATT_ROOT=/path/to/djgpp/net/watt \
+      --host=i586-pc-msdosdjgpp \
+      --with-openssl=/path/to/djgpp \
+      --with-zlib=/path/to/djgpp \
+      --without-libpsl \
+      --disable-shared
 
-For build configuration options, please see the mingw-w64 section.
+    cmake . \
+      -DCMAKE_SYSTEM_NAME=DOS \
+      -DCMAKE_C_COMPILER_TARGET=i586-pc-msdosdjgpp \
+      -DCMAKE_C_COMPILER=/path/to/djgpp/bin/i586-pc-msdosdjgpp-gcc \
+      -DWATT_ROOT=/path/to/djgpp/net/watt \
+      -DOPENSSL_INCLUDE_DIR=/path/to/djgpp/include \
+      -DOPENSSL_SSL_LIBRARY=/path/to/djgpp/lib/libssl.a \
+      -DOPENSSL_CRYPTO_LIBRARY=/path/to/djgpp/lib/libcrypto.a \
+      -DZLIB_INCLUDE_DIR=/path/to/djgpp/include \
+      -DZLIB_LIBRARY=/path/to/djgpp/lib/libz.a \
+      -DCURL_USE_LIBPSL=OFF
 
 Notes:
 
- - DJGPP 2.04 beta has a `sscanf()` bug so the URL parsing is not done
-   properly. Use DJGPP 2.03 until they fix it.
+ - Requires DJGPP 2.04 or upper.
 
  - Compile Watt-32 (and OpenSSL) with the same version of DJGPP. Otherwise
    things go wrong because things like FS-extensions and `errno` values have
@@ -213,9 +246,31 @@ Notes:
 
 ## AmigaOS
 
-Run `make -f Makefile.dist amiga` in the root curl dir.
+You can use either autotools or cmake:
 
-For build configuration options, please see the mingw-w64 section.
+    ./configure \
+      CC=/opt/amiga/bin/m68k-amigaos-gcc \
+      AR=/opt/amiga/bin/m68k-amigaos-ar \
+      RANLIB=/opt/amiga/bin/m68k-amigaos-ranlib \
+      --host=m68k-amigaos \
+      --with-amissl \
+      CFLAGS='-O0 -msoft-float -mcrt=clib2' \
+      CPPFLAGS=-I/path/to/AmiSSL/Developer/include \
+      LDFLAGS=-L/path/to/AmiSSL/Developer/lib/AmigaOS3 \
+      LIBS='-lnet -lm -latomic' \
+      --without-libpsl \
+      --disable-shared
+
+    cmake . \
+      -DAMIGA=1 \
+      -DCMAKE_SYSTEM_NAME=Generic \
+      -DCMAKE_C_COMPILER_TARGET=m68k-unknown-amigaos \
+      -DCMAKE_C_COMPILER=/opt/amiga/bin/m68k-amigaos-gcc \
+      -DCMAKE_C_FLAGS='-O0 -msoft-float -mcrt=clib2' \
+      -DAMISSL_INCLUDE_DIR=/path/to/AmiSSL/Developer/include \
+      -DAMISSL_STUBS_LIBRARY=/path/to/AmiSSL/Developer/lib/AmigaOS3/libamisslstubs.a \
+      -DAMISSL_AUTO_LIBRARY=/path/to/AmiSSL/Developer/lib/AmigaOS3/libamisslauto.a \
+      -DCURL_USE_LIBPSL=OFF
 
 ## Disabling Specific Protocols in Windows builds
 
@@ -237,7 +292,7 @@ Note: The pre-processor settings can be found using the Visual Studio IDE
 under "Project -> Properties -> Configuration Properties -> C/C++ ->
 Preprocessor".
 
-## Using BSD-style lwIP instead of Winsock TCP/IP stack in Win32 builds
+## Using BSD-style lwIP instead of Winsock TCP/IP stack in Windows builds
 
 In order to compile libcurl and curl using BSD-style lwIP TCP/IP stack it is
 necessary to make the definition of the preprocessor symbol `USE_LWIPSOCK`
@@ -505,14 +560,14 @@ disabling support for some feature (run `./configure --help` to see them all):
  - `--disable-mime` (MIME API)
  - `--disable-netrc`  (.netrc file)
  - `--disable-ntlm` (NTLM authentication)
- - `--disable-ntlm-wb` (NTLM WinBind)
+ - `--disable-ntlm-wb` (NTLM winbind)
  - `--disable-progress-meter` (graphical progress meter in library)
  - `--disable-proxy` (HTTP and SOCKS proxies)
  - `--disable-pthreads` (multi-threading)
  - `--disable-socketpair` (socketpair for asynchronous name resolving)
  - `--disable-threaded-resolver`  (threaded name resolver)
  - `--disable-tls-srp` (Secure Remote Password authentication for TLS)
- - `--disable-unix-sockets` (UNIX sockets)
+ - `--disable-unix-sockets` (Unix sockets)
  - `--disable-verbose` (eliminates debugging strings and error code strings)
  - `--disable-versioned-symbols` (versioned symbols)
  - `--enable-symbol-hiding` (eliminates unneeded symbols in the shared library)
@@ -554,22 +609,24 @@ that are not automatically detected:
 
 This is a probably incomplete list of known CPU architectures and operating
 systems that curl has been compiled for. If you know a system curl compiles
-and runs on, that is not listed, please let us know!
+and runs on, that is not listed, please let us know.
 
-## 101 Operating Systems
+## 104 Operating Systems
 
-    AIX, AmigaOS, Android, ArcoOS, Aros, Atari FreeMiNT, BeOS, Blackberry 10,
-    Blackberry Tablet OS, Cell OS, CheriBSD, Chrome OS, Cisco IOS, DG/UX,
-    Dragonfly BSD, DR DOS, eCOS, FreeBSD, FreeDOS, FreeRTOS, Fuchsia, Garmin OS,
-    Genode, Haiku, HardenedBSD, HP-UX, Hurd, Illumos, Integrity, iOS, ipadOS, IRIX,
-    Linux, Lua RTOS, Mac OS 9, macOS, Mbed, Meego, Micrium, MINIX, Moblin, MorphOS,
-    MPE/iX, MS-DOS, NCR MP-RAS, NetBSD, Netware, NextStep, Nintendo Switch,
-    NonStop OS, NuttX, OpenBSD, OpenStep, Orbis OS, OS/2, OS/400, OS21, Plan 9,
-    PlayStation Portable, QNX, Qubes OS, ReactOS, Redox, RICS OS, ROS, RTEMS,
-    Sailfish OS, SCO Unix, Serenity, SINIX-Z, SkyOS, Solaris, Sortix, SunOS,
-    Syllable OS, Symbian, Tizen, TPF, Tru64, tvOS, ucLinux, Ultrix, UNICOS,
-    UnixWare, VMS, vxWorks, watchOS, Wear OS, WebOS, Wii system software, Wii U,
-    Windows, Windows CE, Xbox System, Xenix, Zephyr, z/OS, z/TPF, z/VM, z/VSE
+    AIX, AmigaOS, Android, ArcoOS, Aros, Atari FreeMiNT, BeOS, Blackberry
+    10, Blackberry Tablet OS, Cell OS, CheriBSD, Chrome OS, Cisco IOS,
+    DG/UX, DR DOS, Dragonfly BSD, eCOS, FreeBSD, FreeDOS, FreeRTOS, Fuchsia,
+    Garmin OS, Genode, Haiku, HardenedBSD, HP-UX, Hurd, IBM I, illumos,
+    Integrity, iOS, ipadOS, IRIX, Linux, Lua RTOS, Mac OS 9, macOS, Maemo,
+    Mbed, Meego, Micrium, MINIX, Minoca, Moblin, MorphOS, MPE/iX, MS-DOS,
+    NCR MP-RAS, NetBSD, Netware, NextStep, Nintendo 3DS Nintendo Switch,
+    NonStop OS, NuttX, OpenBSD, OpenStep, Orbis OS, OS/2, OS21, Plan 9,
+    PlayStation Portable, QNX, Qubes OS, ReactOS, Redox, RISC OS, ROS,
+    RTEMS, Sailfish OS, SCO Unix, Serenity, SINIX-Z, SkyOS, software,
+    Solaris, Sortix, SunOS, Syllable OS, Symbian, Tizen, TPF, Tru64, tvOS,
+    ucLinux, Ultrix, UNICOS, UnixWare, VMS, vxWorks, watchOS, Wear OS,
+    WebOS, Wii system Wii U, Windows CE, Windows, Xbox System, Xenix, z/OS,
+    z/TPF, z/VM, z/VSE, Zephyr
 
 ## 28 CPU Architectures
 

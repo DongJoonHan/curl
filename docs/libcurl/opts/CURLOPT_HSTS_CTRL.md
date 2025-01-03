@@ -11,6 +11,7 @@ See-also:
   - CURLOPT_CONNECT_TO (3)
   - CURLOPT_HSTS (3)
   - CURLOPT_RESOLVE (3)
+Added-in: 7.74.0
 ---
 
 # NAME
@@ -52,7 +53,9 @@ to the file when closing the handle.
 
 # DEFAULT
 
-0. HSTS is disabled by default.
+0
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -67,10 +70,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.74.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

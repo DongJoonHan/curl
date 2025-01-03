@@ -10,6 +10,7 @@ See-also:
 Protocol:
   - FTP
   - SFTP
+Added-in: 7.1
 ---
 
 # NAME
@@ -32,11 +33,17 @@ after your FTP transfer request. The commands are only issued if no error
 occur. The linked list should be a fully valid list of struct curl_slist
 structs properly filled in as described for CURLOPT_QUOTE(3).
 
-Disable this operation again by setting a NULL to this option.
+Using this option multiple times makes the last set list override the previous
+ones. Set it to NULL to disable its use again.
+
+libcurl does not copy the list, it needs to be kept around until after the
+transfer has completed.
 
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -59,13 +66,15 @@ int main(void)
 
     curl_easy_cleanup(curl);
   }
+  curl_slist_free_all(cmdlist);
 }
 ~~~
 
-# AVAILABILITY
-
-If support for the protocols are built-in.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

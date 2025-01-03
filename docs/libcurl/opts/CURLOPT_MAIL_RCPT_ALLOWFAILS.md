@@ -9,6 +9,7 @@ See-also:
   - CURLOPT_MAIL_RCPT (3)
 Protocol:
   - SMTP
+Added-in: 8.2.0
 ---
 
 # NAME
@@ -44,6 +45,8 @@ RCPT TO command.
 
 0
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -68,12 +71,16 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
+# HISTORY
 
-This option was called CURLOPT_MAIL_RCPT_ALLLOWFAILS before 8.2.0
+This option was called CURLOPT_MAIL_RCPT_ALLLOWFAILS (with three instead of
+two letter L) before 8.2.0
 
-Added in 7.69.0.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

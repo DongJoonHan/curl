@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_SOCKOPTDATA (3)
 Protocol:
   - All
+Added-in: 7.16.0
 ---
 
 # NAME
@@ -72,7 +73,9 @@ not attempt to connect (again).
 
 # DEFAULT
 
-By default, this callback is NULL and unused.
+NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -120,11 +123,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.16.0. The *CURL_SOCKOPT_ALREADY_CONNECTED* return code was
-added in 7.21.5.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

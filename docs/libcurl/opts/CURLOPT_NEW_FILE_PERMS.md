@@ -11,6 +11,7 @@ Protocol:
   - SFTP
   - SCP
   - FILE
+Added-in: 7.16.4
 ---
 
 # NAME
@@ -36,6 +37,8 @@ The only protocols that can use this are *sftp://*, *scp://*, and *file://*.
 
 0644
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -51,10 +54,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.16.4
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

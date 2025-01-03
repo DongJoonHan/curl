@@ -12,6 +12,7 @@ Protocol:
   - TLS
 TLS-backend:
   - All
+Added-in: 7.52.0
 ---
 
 # NAME
@@ -38,7 +39,7 @@ This is the proxy version of CURLOPT_SSL_VERIFYPEER(3) that is used for
 ordinary HTTPS servers.
 
 When negotiating a TLS or SSL connection, the server sends a certificate
-indicating its identity. Curl verifies whether the certificate is authentic,
+indicating its identity. curl verifies whether the certificate is authentic,
 i.e. that you can trust that the server is who the certificate says it is.
 This trust is based on a chain of digital signatures, rooted in certification
 authority (CA) certificates you supply. curl uses a default bundle of CA
@@ -66,6 +67,8 @@ the correct end-point.
 
 1
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -83,12 +86,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.52.0
-
-If built TLS enabled.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

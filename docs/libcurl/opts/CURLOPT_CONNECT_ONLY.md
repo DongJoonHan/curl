@@ -11,6 +11,7 @@ See-also:
   - curl_easy_send (3)
 Protocol:
   - All
+Added-in: 7.15.2
 ---
 
 # NAME
@@ -54,6 +55,8 @@ curl_easy_recv(3) do not function.
 
 0
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -66,16 +69,21 @@ int main(void)
     curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
     ret = curl_easy_perform(curl);
     if(ret == CURLE_OK) {
-      /* only connected! */
+      /* only connected */
     }
   }
 }
 ~~~
 
-# AVAILABILITY
+# HISTORY
 
-Added in 7.15.2. WS and WSS support added in 7.86.0.
+WS and WSS support added in 7.86.0.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

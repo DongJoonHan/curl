@@ -11,6 +11,7 @@ See-also:
   - CURLOPT_TRANSFERTEXT (3)
 Protocol:
     - All
+Added-in: 7.18.0
 ---
 
 # NAME
@@ -38,6 +39,8 @@ doing FTP via a proxy. Beware that not all proxies support this feature.
 
 0, disabled
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -57,11 +60,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.18.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if the
-enabled value is not supported.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

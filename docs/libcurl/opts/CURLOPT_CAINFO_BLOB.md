@@ -19,6 +19,7 @@ TLS-backend:
   - wolfSSL
   - Secure Transport
   - Schannel
+Added-in: 7.77.0
 ---
 
 # NAME
@@ -53,6 +54,8 @@ This option overrides CURLOPT_CAINFO(3).
 
 NULL
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -76,15 +79,17 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.77.0.
+# HISTORY
 
 This option is supported by the BearSSL (since 7.79.0), mbedTLS (since
-7.81.0), rustls (since 7.82.0), wolfSSL (since 8.2.0), OpenSSL, Secure
+7.81.0), Rustls (since 7.82.0), wolfSSL (since 8.2.0), OpenSSL, Secure
 Transport and Schannel backends.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, CURLE_UNKNOWN_OPTION if not, or
-CURLE_OUT_OF_MEMORY if there was insufficient heap space.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

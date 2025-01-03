@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_TIMEOUT (3)
 Protocol:
   - All
+Added-in: 7.15.5
 ---
 
 # NAME
@@ -43,6 +44,8 @@ This option does not affect transfer speeds done with FILE:// URLs.
 
 0, disabled
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -59,10 +62,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.15.5
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

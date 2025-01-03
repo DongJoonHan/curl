@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_PREREQDATA (3)
 Protocol:
   - All
+Added-in: 7.80.0
 ---
 
 # NAME
@@ -50,7 +51,8 @@ This function may be called multiple times if redirections are enabled and are
 being followed (see CURLOPT_FOLLOWLOCATION(3)).
 
 The callback function must return *CURL_PREREQFUNC_OK* on success, or
-*CURL_PREREQFUNC_ABORT* to cause the transfer to fail.
+*CURL_PREREQFUNC_ABORT* to cause the transfer to fail with result
+*CURLE_ABORTED_BY_CALLBACK*.
 
 This function is passed the following arguments:
 
@@ -83,7 +85,9 @@ The pointer you set with CURLOPT_PREREQDATA(3).
 
 # DEFAULT
 
-By default, this is NULL and unused.
+NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -114,10 +118,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.80.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

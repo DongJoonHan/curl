@@ -9,7 +9,8 @@ See-also:
   - CURLOPT_SOCKOPTFUNCTION (3)
   - CURLOPT_TCP_KEEPALIVE (3)
 Protocol:
-  - All
+  - TCP
+Added-in: 7.11.2
 ---
 
 # NAME
@@ -45,6 +46,8 @@ overdone.
 
 1
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -60,10 +63,15 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
+# HISTORY
 
-Always. The default was changed to 1 from 0 in 7.50.2.
+The default was changed to 1 from 0 in 7.50.2.
+
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

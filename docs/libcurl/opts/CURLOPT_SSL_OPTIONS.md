@@ -12,6 +12,7 @@ Protocol:
   - TLS
 TLS-backend:
   - All
+Added-in: 7.25.0
 ---
 
 # NAME
@@ -85,9 +86,20 @@ certificate that supports client authentication in the OS certificate store it
 could be a privacy violation and unexpected.
 (Added in 7.77.0)
 
+## CURLSSLOPT_EARLYDATA
+
+Tell libcurl to try sending application data as TLS1.3 early data. This option
+is only supported for GnuTLS. This option works on a best effort basis,
+in cases when it wasn't possible to send early data the request is resent
+normally post-handshake.
+This option does not work when using QUIC.
+(Added in 8.11.0)
+
 # DEFAULT
 
 0
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -107,10 +119,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.25.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

@@ -1,3 +1,9 @@
+<!--
+Copyright (C) Daniel Stenberg, <daniel@haxx.se>, et al.
+
+SPDX-License-Identifier: curl
+-->
+
 # curl sponsors
 
 A sponsor is someone who donates money or resources to the curl project for no
@@ -38,4 +44,4 @@ gambling, pornography, social media manipulation etc.
 ## Past Sponsors
 
 Sponsors that stop paying are considered *Past Sponsors* and are not displayed
-on the sponsor page anymore. We thank you for your contributions!
+on the sponsor page anymore. We thank you for your contributions.

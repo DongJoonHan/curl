@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_VERBOSE (3)
 Protocol:
   - All
+Added-in: 7.10.3
 ---
 
 # NAME
@@ -34,6 +35,8 @@ never does anything with this data.
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -61,10 +64,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.10.3
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

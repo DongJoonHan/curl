@@ -10,6 +10,7 @@ See-also:
 Protocol:
   - SFTP
   - SCP
+Added-in: 7.19.6
 ---
 
 # NAME
@@ -32,6 +33,8 @@ callback set with CURLOPT_SSH_KEYFUNCTION(3).
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -65,10 +68,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.19.6
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

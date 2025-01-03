@@ -11,6 +11,7 @@ Protocol:
   - HTTP
   - IMAP
   - SMTP
+Added-in: 7.81.0
 ---
 
 # NAME
@@ -56,6 +57,8 @@ containing multipart form is sent, this is normally transmitted as
 
 0, meaning disabled.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -88,10 +91,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Option added in 7.81.0.
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

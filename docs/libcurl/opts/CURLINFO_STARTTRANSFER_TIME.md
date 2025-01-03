@@ -11,6 +11,7 @@ See-also:
   - curl_easy_setopt (3)
 Protocol:
   - All
+Added-in: 7.9.2
 ---
 
 # NAME
@@ -37,6 +38,8 @@ When a redirect is followed, the time from each request is added together.
 
 See also the TIMES overview in the curl_easy_getinfo(3) man page.
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -60,10 +63,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.9.2
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, and CURLE_UNKNOWN_OPTION if not.
+curl_easy_getinfo(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

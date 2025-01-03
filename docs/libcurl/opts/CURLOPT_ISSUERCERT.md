@@ -13,6 +13,7 @@ Protocol:
 TLS-backend:
   - OpenSSL
   - GnuTLS
+Added-in: 7.19.0
 ---
 
 # NAME
@@ -45,12 +46,17 @@ which is returned if the setup of the SSL/TLS session has failed due to a
 mismatch with the issuer of peer certificate (CURLOPT_SSL_VERIFYPEER(3)
 has to be set too for the check to fail). (Added in 7.19.0)
 
+Using this option multiple times makes the last set string override the
+previous ones. Set it to NULL to disable its use again.
+
 The application does not have to keep the string around after setting this
 option.
 
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -68,11 +74,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-If built TLS enabled
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, CURLE_UNKNOWN_OPTION if not, or
-CURLE_OUT_OF_MEMORY if there was insufficient heap space.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

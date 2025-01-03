@@ -12,6 +12,7 @@ See-also:
   - curl_global_trace (3)
 Protocol:
   - All
+Added-in: 7.9.6
 ---
 
 # NAME
@@ -91,15 +92,19 @@ The data is SSL/TLS (binary) data sent to the peer.
 
 The data is SSL/TLS (binary) data received from the peer.
 
-WARNING: This callback may be called with the curl *handle* set to an
-internal handle. (Added in 8.4.0)
+##
 
-If you need to distinguish your curl *handle* from internal handles then
-set CURLOPT_PRIVATE(3) on your handle.
+WARNING: This callback may be called with the curl *handle* set to an internal
+handle. (Added in 8.4.0)
+
+If you need to distinguish your curl *handle* from internal handles then set
+CURLOPT_PRIVATE(3) on your handle.
 
 # DEFAULT
 
 NULL
+
+# %PROTOCOLS%
 
 # EXAMPLE
 
@@ -205,10 +210,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Always
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

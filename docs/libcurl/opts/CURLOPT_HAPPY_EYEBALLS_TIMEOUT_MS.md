@@ -10,6 +10,7 @@ See-also:
   - CURLOPT_CONNECTTIMEOUT_MS (3)
   - CURLOPT_LOW_SPEED_LIMIT (3)
   - CURLOPT_TIMEOUT (3)
+Added-in: 7.59.0
 ---
 
 # NAME
@@ -42,6 +43,8 @@ currently defaults to 200 ms. Firefox and Chrome currently default to 300 ms.
 
 CURL_HET_DEFAULT (currently defined as 200L)
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -60,10 +63,11 @@ int main(void)
 }
 ~~~
 
-# AVAILABILITY
-
-Added in 7.59.0
+# %AVAILABILITY%
 
 # RETURN VALUE
 
-Returns CURLE_OK
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).

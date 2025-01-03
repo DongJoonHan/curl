@@ -11,6 +11,7 @@ See-also:
   - CURLOPT_COOKIEJAR (3)
 Protocol:
   - HTTP
+Added-in: 7.14.1
 ---
 
 # NAME
@@ -69,6 +70,8 @@ loads all cookies from the files specified by CURLOPT_COOKIEFILE(3)
 
 NULL
 
+# %PROTOCOLS%
+
 # EXAMPLE
 
 ~~~c
@@ -78,7 +81,7 @@ NULL
 
 int main(void)
 {
-  char *my_cookie =
+  const char *my_cookie =
     "example.com"    /* Hostname */
     SEP "FALSE"      /* Include subdomains */
     SEP "/"          /* Path */
@@ -118,7 +121,7 @@ int main(void)
 The cookie file format and general cookie concepts in curl are described
 online here: https://curl.se/docs/http-cookies.html
 
-# AVAILABILITY
+# HISTORY
 
 **ALL** was added in 7.14.1
 
@@ -128,7 +131,11 @@ online here: https://curl.se/docs/http-cookies.html
 
 **RELOAD** was added in 7.39.0
 
+# %AVAILABILITY%
+
 # RETURN VALUE
 
-Returns CURLE_OK if the option is supported, CURLE_UNKNOWN_OPTION if not, or
-CURLE_OUT_OF_MEMORY if there was insufficient heap space.
+curl_easy_setopt(3) returns a CURLcode indicating success or error.
+
+CURLE_OK (0) means everything was OK, non-zero means an error occurred, see
+libcurl-errors(3).
