@@ -21,6 +21,28 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file
+ * @brief Client writer and client reader stacks for transfer data.
+ *
+ * This file implements the two filter-like stacks that sit between libcurl
+ * and the application for one transfer:
+ *
+ * - The client *writer* stack (data->req.writer) receives downloaded data
+ *   (headers, body, informational text) and passes it through ordered phases
+ *   (raw, before-decode, content-decode, protocol, client) until it reaches
+ *   the application's write callbacks (see cw-out.c).
+ * - The client *reader* stack (data->req.reader) produces upload data from
+ *   the application's read callback, a memory buffer, or nothing, optionally
+ *   converting line endings.
+ *
+ * Each stack is a singly linked list of instances. An instance is created
+ * from a type descriptor (struct Curl_cwtype / struct Curl_crtype) and has
+ * a context area allocated together with the instance itself.
+ *
+ * @see sendf.h, cw-out.h, cw-pause.h
+ */
+
 #include "curl_setup.h"
 
 #ifdef HAVE_NETINET_IN_H
@@ -38,6 +60,16 @@
 #include "multiif.h"
 #include "progress.h"
 
+/**
+ * @brief Close and free all client writers of the transfer.
+ * @internal
+ *
+ * Pops each writer off data->req.writer.stack, calls its do_close() handler
+ * and frees it. Also clears the "paused" flag of the writer stack.
+ *
+ * @param[in,out] data Transfer whose writer stack is emptied.
+ * @post data->req.writer.stack == NULL and data->req.writer.paused == FALSE.
+ */
 static void cl_reset_writer(struct Curl_easy *data)
 {
   struct Curl_cwriter *writer = data->req.writer.stack;
@@ -50,6 +82,17 @@ static void cl_reset_writer(struct Curl_easy *data)
   data->req.writer.paused = FALSE;
 }
 
+/**
+ * @brief Close and free all client readers of the transfer.
+ * @internal
+ *
+ * Pops each reader off data->req.reader.stack, calls its do_close() handler
+ * and frees it. Resets the "reader started" marker so the upload rate
+ * limiter is restarted on the next read.
+ *
+ * @param[in,out] data Transfer whose reader stack is emptied.
+ * @post data->req.reader.stack == NULL and data->req.reader_started is FALSE.
+ */
 static void cl_reset_reader(struct Curl_easy *data)
 {
   struct Curl_creader *reader = data->req.reader.stack;
@@ -62,6 +105,16 @@ static void cl_reset_reader(struct Curl_easy *data)
   }
 }
 
+/**
+ * @brief Tear down both client stacks and reset request counters.
+ *
+ * Used when the transfer is done with its request/response cycle for good.
+ * Unlike Curl_client_reset() this always discards the readers.
+ *
+ * @param[in,out] data Transfer to clean up.
+ * @post No readers or writers remain, bytecount and headerline are 0.
+ * @see Curl_client_reset()
+ */
 void Curl_client_cleanup(struct Curl_easy *data)
 {
   cl_reset_reader(data);
@@ -71,6 +124,17 @@ void Curl_client_cleanup(struct Curl_easy *data)
   data->req.headerline = 0;
 }
 
+/**
+ * @brief Reset the client stacks between two requests of one transfer.
+ *
+ * The writer stack is always discarded. The reader stack is kept when a
+ * rewind was requested (see Curl_creader_set_rewind()), so that the upload
+ * data can be sent again by the next request; otherwise it is discarded.
+ *
+ * @param[in,out] data Transfer to reset.
+ * @post Writer stack is empty, bytecount and headerline are 0.
+ * @see Curl_client_start(), Curl_client_cleanup()
+ */
 void Curl_client_reset(struct Curl_easy *data)
 {
   if(data->req.rewind_read) {
@@ -87,6 +151,19 @@ void Curl_client_reset(struct Curl_easy *data)
   data->req.headerline = 0;
 }
 
+/**
+ * @brief Prepare the client readers for a new request.
+ *
+ * If a rewind was requested, every reader in the stack is sent
+ * CURL_CRCNTRL_REWIND. When that succeeded the rewind flag is cleared and
+ * the reader stack is dropped, to be rebuilt for the new request.
+ *
+ * @param[in,out] data Transfer about to start a request.
+ * @return CURLE_OK on success or when no rewind was pending.
+ * @return The error code of the first reader whose rewind failed (e.g.
+ *         CURLE_SEND_FAIL_REWIND); the failure is also reported via failf().
+ * @see Curl_creader_set_rewind()
+ */
 CURLcode Curl_client_start(struct Curl_easy *data)
 {
   if(data->req.rewind_read) {
@@ -109,16 +186,36 @@ CURLcode Curl_client_start(struct Curl_easy *data)
   return CURLE_OK;
 }
 
+/**
+ * @brief Tell if the reader stack is marked to be rewound at next start.
+ *
+ * @param[in] data Transfer to query.
+ * @return TRUE if a rewind has been requested, FALSE otherwise.
+ */
 bool Curl_creader_will_rewind(struct Curl_easy *data)
 {
   return (bool)data->req.rewind_read;
 }
 
+/**
+ * @brief Request (or cancel) a rewind of the readers before the next request.
+ *
+ * @param[in,out] data   Transfer to modify.
+ * @param[in]     enable TRUE to request a rewind, FALSE to cancel it.
+ * @see Curl_client_start()
+ */
 void Curl_creader_set_rewind(struct Curl_easy *data, bool enable)
 {
   data->req.rewind_read = !!enable;
 }
 
+/**
+ * @brief Default do_init() handler for client writers: does nothing.
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] writer Writer being initialized (unused).
+ * @return CURLE_OK always.
+ */
 CURLcode Curl_cwriter_def_init(struct Curl_easy *data,
                                struct Curl_cwriter *writer)
 {
@@ -127,6 +224,18 @@ CURLcode Curl_cwriter_def_init(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default do_write() handler: pass the data to the next writer.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] writer Writer whose successor receives the data.
+ * @param[in]     type   CLIENTWRITE_* bit mask describing the data.
+ * @param[in]     buf    Data to write, not copied.
+ * @param[in]     nbytes Number of bytes in buf.
+ * @return Result of the next writer (CURLE_OK on success).
+ * @pre writer->next must not be NULL; the last writer in a stack must
+ *      implement its own do_write().
+ */
 CURLcode Curl_cwriter_def_write(struct Curl_easy *data,
                                 struct Curl_cwriter *writer, int type,
                                 const char *buf, size_t nbytes)
@@ -134,12 +243,26 @@ CURLcode Curl_cwriter_def_write(struct Curl_easy *data,
   return Curl_cwriter_write(data, writer->next, type, buf, nbytes);
 }
 
+/**
+ * @brief Default do_flush() handler: flush the next writer.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] writer Writer whose successor is flushed.
+ * @param[in]     eos    TRUE if the end of the stream has been reached.
+ * @return Result of the next writer's flush (CURLE_OK on success).
+ */
 CURLcode Curl_cwriter_def_flush(struct Curl_easy *data,
                                 struct Curl_cwriter *writer, bool eos)
 {
   return Curl_cwriter_flush(data, writer->next, eos);
 }
 
+/**
+ * @brief Default do_close() handler for client writers: does nothing.
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] writer Writer being closed (unused).
+ */
 void Curl_cwriter_def_close(struct Curl_easy *data,
                             struct Curl_cwriter *writer)
 {
@@ -147,6 +270,15 @@ void Curl_cwriter_def_close(struct Curl_easy *data,
   (void)writer;
 }
 
+/**
+ * @brief Compute how many more body bytes may be written under a limit.
+ * @internal
+ *
+ * @param[in] data  Transfer, its req.bytecount counts bytes already written.
+ * @param[in] limit Maximum allowed body size, or -1 for "no limit".
+ * @return SIZE_MAX if limit is -1, otherwise limit minus bytecount clamped
+ *         to the range 0..SIZE_MAX.
+ */
 static size_t get_max_body_write_len(struct Curl_easy *data, curl_off_t limit)
 {
   if(limit != -1) {
@@ -156,14 +288,42 @@ static size_t get_max_body_write_len(struct Curl_easy *data, curl_off_t limit)
   return SIZE_MAX;
 }
 
+/**
+ * @brief Context of the download writer (phase CURL_CW_PROTOCOL).
+ * @internal
+ */
 struct cw_download_ctx {
-  struct Curl_cwriter super;
-  BIT(started_response);
-  BIT(started_body);
+  struct Curl_cwriter super;  ///< base writer, must be first
+  BIT(started_response);  ///< response start time recorded
+  BIT(started_body);  ///< download rate limit started
 };
 
-/* Download client writer in phase CURL_CW_PROTOCOL that
- * sees the "real" download body data. */
+/**
+ * @brief Download writer in phase CURL_CW_PROTOCOL.
+ * @internal
+ *
+ * Sees the real response data once all transfer and content decoding is
+ * done. For headers it only forwards them (honoring suppression of CONNECT
+ * headers). For body bytes it checks them against the announced size, the
+ * CURLOPT_MAXFILESIZE limit and "no body expected" conditions, forwards the
+ * permitted part, and updates byte counters and download progress. Starts
+ * the TIMER_STARTTRANSFER timer and the download rate limiter on first use.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] writer This writer, its ctx is a struct cw_download_ctx.
+ * @param[in]     type   CLIENTWRITE_* bit mask of the data.
+ * @param[in]     buf    Data to write.
+ * @param[in]     nbytes Length of buf.
+ * @return CURLE_OK on success.
+ * @return CURLE_WEIRD_SERVER_REPLY if a body arrives when none is wanted
+ *         and no headers were received.
+ * @return CURLE_PARTIAL_FILE if the response ended before the announced
+ *         size was delivered.
+ * @return CURLE_FILESIZE_EXCEEDED if the maximum file size was exceeded.
+ * @return Any error returned by the next writer.
+ * @note Excess bytes beyond the announced size are dropped and the
+ *       connection is marked for closing.
+ */
 static CURLcode cw_download_write(struct Curl_easy *data,
                                   struct Curl_cwriter *writer, int type,
                                   const char *buf, size_t nbytes)
@@ -288,6 +448,10 @@ static CURLcode cw_download_write(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Type descriptor of the download writer ("protocol").
+ * @internal
+ */
 static const struct Curl_cwtype cw_download = {
   "protocol",
   NULL,
@@ -299,8 +463,20 @@ static const struct Curl_cwtype cw_download = {
   sizeof(struct cw_download_ctx)
 };
 
-/* RAW client writer in phase CURL_CW_RAW that
- * enabled tracing of raw data. */
+/**
+ * @brief RAW client writer in phase CURL_CW_RAW.
+ * @internal
+ *
+ * Enables tracing of the raw (still encoded) body data when verbose output
+ * is on, then forwards everything unchanged to the next writer.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] writer This writer.
+ * @param[in]     type   CLIENTWRITE_* bit mask of the data.
+ * @param[in]     buf    Data to write.
+ * @param[in]     nbytes Length of buf.
+ * @return Result of the next writer.
+ */
 static CURLcode cw_raw_write(struct Curl_easy *data,
                              struct Curl_cwriter *writer, int type,
                              const char *buf, size_t nbytes)
@@ -311,6 +487,10 @@ static CURLcode cw_raw_write(struct Curl_easy *data,
   return Curl_cwriter_write(data, writer->next, type, buf, nbytes);
 }
 
+/**
+ * @brief Type descriptor of the raw tracing writer ("raw").
+ * @internal
+ */
 static const struct Curl_cwtype cw_raw = {
   "raw",
   NULL,
@@ -322,6 +502,15 @@ static const struct Curl_cwtype cw_raw = {
   sizeof(struct Curl_cwriter)
 };
 
+/**
+ * @brief Link a writer into the stack as first of its phase.
+ * @internal
+ *
+ * Writers of lower phases stay in front. Cannot fail.
+ *
+ * @param[in,out] data   Transfer owning the writer stack.
+ * @param[in]     writer Initialized writer, ownership moves to the stack.
+ */
 static void cwriter_add(struct Curl_easy *data,
                         struct Curl_cwriter *writer)
 {
@@ -335,6 +524,17 @@ static void cwriter_add(struct Curl_easy *data,
   *anchor = writer;
 }
 
+/**
+ * @brief Create the default writer stack.
+ * @internal
+ *
+ * Installs the client output writer, the download writer and the raw
+ * tracing writer.
+ *
+ * @param[in,out] data Transfer, its writer stack must still be empty.
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY or the error of a writer's do_init().
+ */
 static CURLcode do_init_writer_stack(struct Curl_easy *data)
 {
   struct Curl_cwriter *writer;
@@ -363,6 +563,24 @@ static CURLcode do_init_writer_stack(struct Curl_easy *data)
 
    The bit pattern defines to what "streams" to write to. Body and/or header.
    The defines are in sendf.h of course.
+/**
+ * @brief Send data to the client write callback(s) via the writer stack.
+ *
+ * The bit pattern in type defines to what "streams" to write: body and/or
+ * header (the CLIENTWRITE_* defines are in sendf.h). The writer stack is
+ * created on first use.
+ *
+ * @param[in,out] data Transfer.
+ * @param[in]     type Bit mask of CLIENTWRITE_*. Must contain one of BODY,
+ *                     HEADER or INFO; BODY and INFO may only be combined
+ *                     with EOS.
+ * @param[in]     buf  Data to write.
+ * @param[in]     len  Length of buf.
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY if the stack could not be created.
+ * @return Any error from a writer, e.g. CURLE_WRITE_ERROR from the
+ *         application callback or CURLE_FILESIZE_EXCEEDED.
+ * @see Curl_client_flush()
  */
 CURLcode Curl_client_write(struct Curl_easy *data, int type, const char *buf,
                            size_t len)
@@ -392,6 +610,14 @@ CURLcode Curl_client_write(struct Curl_easy *data, int type, const char *buf,
   return result;
 }
 
+/**
+ * @brief Flush all client writers, e.g. buffered or paused data.
+ *
+ * @param[in,out] data Transfer.
+ * @param[in]     eos  TRUE if no more data will follow.
+ * @return CURLE_OK on success, otherwise the error of a writer's flush.
+ * @see Curl_client_write()
+ */
 CURLcode Curl_client_flush(struct Curl_easy *data, bool eos)
 {
   CURLcode result;
@@ -408,7 +634,23 @@ CURLcode Curl_client_flush(struct Curl_easy *data, bool eos)
   return result;
 }
 
-/* Create an unencoding writer stage using the given handler. */
+/**
+ * @brief Create an unencoding writer stage using the given handler.
+ *
+ * Allocates a zeroed instance of cwt->cwriter_size bytes and calls the
+ * type's do_init().
+ *
+ * @param[out] pwriter Receives the new writer, or NULL on failure.
+ * @param[in]  data    Transfer.
+ * @param[in]  cwt     Writer type, must outlive the writer.
+ * @param[in]  phase   Phase in which the writer is to run.
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY if allocation failed, or the error returned
+ *         by do_init() (the instance is freed in that case).
+ * @note The caller owns the writer until it is added to a stack with
+ *       Curl_cwriter_add().
+ * @see Curl_cwriter_free()
+ */
 CURLcode Curl_cwriter_create(struct Curl_cwriter **pwriter,
                              struct Curl_easy *data,
                              const struct Curl_cwtype *cwt,
@@ -436,6 +678,13 @@ out:
   return result;
 }
 
+/**
+ * @brief Close and free a writer that is not (or no longer) in a stack.
+ *
+ * @param[in] data   Transfer.
+ * @param[in] writer Writer to destroy, may be NULL.
+ * @warning The writer must not be linked in a stack, it is not unlinked.
+ */
 void Curl_cwriter_free(struct Curl_easy *data,
                        struct Curl_cwriter *writer)
 {
@@ -445,6 +694,13 @@ void Curl_cwriter_free(struct Curl_easy *data,
   }
 }
 
+/**
+ * @brief Count writers installed in a given phase.
+ *
+ * @param[in] data  Transfer.
+ * @param[in] phase Phase to count.
+ * @return Number of writers in the stack with that phase.
+ */
 size_t Curl_cwriter_count(struct Curl_easy *data, Curl_cwriter_phase phase)
 {
   struct Curl_cwriter *w;
@@ -457,6 +713,13 @@ size_t Curl_cwriter_count(struct Curl_easy *data, Curl_cwriter_phase phase)
   return n;
 }
 
+/**
+ * @brief Make sure the pause writer exists in the stack.
+ * @internal
+ *
+ * @param[in,out] data Transfer.
+ * @return CURLE_OK if present or created, else the creation error.
+ */
 static CURLcode cwriter_ensure_pause_writer(struct Curl_easy *data)
 {
   struct Curl_cwriter *writer =
@@ -472,6 +735,19 @@ static CURLcode cwriter_ensure_pause_writer(struct Curl_easy *data)
   return result;
 }
 
+/**
+ * @brief Add a writer to the transfer's writer stack.
+ *
+ * Creates the default stack first if needed. Writers that may inflate data
+ * (CURL_CW_FLAG_BLOWUP, e.g. decompressors) get a pause writer installed
+ * before them so that output can be held back.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in]     writer Initialized writer to insert.
+ * @return CURLE_OK on success, the writer is then owned by the stack.
+ * @return An error when the stack or pause writer could not be created; the
+ *         caller must then free the writer with Curl_cwriter_free().
+ */
 CURLcode Curl_cwriter_add(struct Curl_easy *data,
                           struct Curl_cwriter *writer)
 {
@@ -497,6 +773,14 @@ CURLcode Curl_cwriter_add(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Find a writer in the stack by its type name.
+ *
+ * @param[in] data Transfer.
+ * @param[in] name Name of the writer type, e.g. "raw".
+ * @return The first matching writer, or NULL if none.
+ * @note The returned pointer is owned by the stack.
+ */
 struct Curl_cwriter *Curl_cwriter_get_by_name(struct Curl_easy *data,
                                               const char *name)
 {
@@ -508,6 +792,14 @@ struct Curl_cwriter *Curl_cwriter_get_by_name(struct Curl_easy *data,
   return NULL;
 }
 
+/**
+ * @brief Find a writer in the stack by its type descriptor.
+ *
+ * @param[in] data Transfer.
+ * @param[in] cwt  Type descriptor to look for (compared by address).
+ * @return The first matching writer, or NULL if none.
+ * @note The returned pointer is owned by the stack.
+ */
 struct Curl_cwriter *Curl_cwriter_get_by_type(struct Curl_easy *data,
                                               const struct Curl_cwtype *cwt)
 {
@@ -519,12 +811,35 @@ struct Curl_cwriter *Curl_cwriter_get_by_type(struct Curl_easy *data,
   return NULL;
 }
 
+/**
+ * @brief Resume writing after the application unpaused the transfer.
+ *
+ * Clears the paused flag and flushes the writer stack so held-back data is
+ * delivered.
+ *
+ * @param[in,out] data Transfer.
+ * @return CURLE_OK on success, or the error from flushing (which may be
+ *         a pause request again).
+ */
 CURLcode Curl_cwriter_unpause(struct Curl_easy *data)
 {
   data->req.writer.paused = FALSE;
   return Curl_cwriter_flush(data, data->req.writer.stack, FALSE);
 }
 
+/**
+ * @brief Read upload data from a given reader.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader to read from, may be NULL.
+ * @param[out]    buf    Buffer receiving data.
+ * @param[in]     blen   Size of buf.
+ * @param[out]    nread  Number of bytes placed in buf, 0 on error.
+ * @param[out]    eos    TRUE when the reader reached its end.
+ * @return CURLE_OK on success.
+ * @return CURLE_READ_ERROR if reader is NULL, otherwise the reader's error
+ *         (e.g. CURLE_ABORTED_BY_CALLBACK).
+ */
 CURLcode Curl_creader_read(struct Curl_easy *data,
                            struct Curl_creader *reader,
                            char *buf, size_t blen, size_t *nread, bool *eos)
@@ -536,6 +851,14 @@ CURLcode Curl_creader_read(struct Curl_easy *data,
   return reader->crt->do_read(data, reader, buf, blen, nread, eos);
 }
 
+/**
+ * @brief Tell the reader chain to forget a seen end-of-stream.
+ *
+ * Sends CURL_CRCNTRL_CLEAR_EOS to the reader and all those after it.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader First reader to notify, may be NULL.
+ */
 void Curl_creader_clear_eos(struct Curl_easy *data,
                             struct Curl_creader *reader)
 {
@@ -545,6 +868,13 @@ void Curl_creader_clear_eos(struct Curl_easy *data,
   }
 }
 
+/**
+ * @brief Default do_init() handler for client readers: does nothing.
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] reader Reader being initialized (unused).
+ * @return CURLE_OK always.
+ */
 CURLcode Curl_creader_def_init(struct Curl_easy *data,
                                struct Curl_creader *reader)
 {
@@ -553,6 +883,12 @@ CURLcode Curl_creader_def_init(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default do_close() handler for client readers: does nothing.
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] reader Reader being closed (unused).
+ */
 void Curl_creader_def_close(struct Curl_easy *data,
                             struct Curl_creader *reader)
 {
@@ -560,6 +896,19 @@ void Curl_creader_def_close(struct Curl_easy *data,
   (void)reader;
 }
 
+/**
+ * @brief Default do_read() handler: read from the next reader.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader whose successor is read.
+ * @param[out]    buf    Buffer receiving data.
+ * @param[in]     blen   Size of buf.
+ * @param[out]    nread  Bytes read.
+ * @param[out]    eos    TRUE at end of stream.
+ * @return Result of the next reader.
+ * @return CURLE_READ_ERROR (with nread 0, eos FALSE) if there is no next
+ *         reader.
+ */
 CURLcode Curl_creader_def_read(struct Curl_easy *data,
                                struct Curl_creader *reader,
                                char *buf, size_t blen,
@@ -575,6 +924,13 @@ CURLcode Curl_creader_def_read(struct Curl_easy *data,
   }
 }
 
+/**
+ * @brief Default needs_rewind() handler.
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @return FALSE always.
+ */
 bool Curl_creader_def_needs_rewind(struct Curl_easy *data,
                                    struct Curl_creader *reader)
 {
@@ -583,6 +939,14 @@ bool Curl_creader_def_needs_rewind(struct Curl_easy *data,
   return FALSE;
 }
 
+/**
+ * @brief Default total_length() handler: ask the next reader.
+ *
+ * @param[in] data   Transfer.
+ * @param[in] reader Reader whose successor is asked.
+ * @return Total length of the upload in bytes, or -1 if unknown or there
+ *         is no next reader.
+ */
 curl_off_t Curl_creader_def_total_length(struct Curl_easy *data,
                                          struct Curl_creader *reader)
 {
@@ -590,6 +954,14 @@ curl_off_t Curl_creader_def_total_length(struct Curl_easy *data,
          reader->next->crt->total_length(data, reader->next) : -1;
 }
 
+/**
+ * @brief Default resume_from() handler: resuming is not supported.
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @param[in] offset Offset to resume at (unused).
+ * @return CURLE_READ_ERROR always.
+ */
 CURLcode Curl_creader_def_resume_from(struct Curl_easy *data,
                                       struct Curl_creader *reader,
                                       curl_off_t offset)
@@ -600,6 +972,14 @@ CURLcode Curl_creader_def_resume_from(struct Curl_easy *data,
   return CURLE_READ_ERROR;
 }
 
+/**
+ * @brief Default cntrl() handler: ignore the control opcode.
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @param[in] opcode Control operation (unused).
+ * @return CURLE_OK always.
+ */
 CURLcode Curl_creader_def_cntrl(struct Curl_easy *data,
                                 struct Curl_creader *reader,
                                 Curl_creader_cntrl opcode)
@@ -610,6 +990,13 @@ CURLcode Curl_creader_def_cntrl(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default is_paused() handler.
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @return FALSE always.
+ */
 bool Curl_creader_def_is_paused(struct Curl_easy *data,
                                 struct Curl_creader *reader)
 {
@@ -618,6 +1005,13 @@ bool Curl_creader_def_is_paused(struct Curl_easy *data,
   return FALSE;
 }
 
+/**
+ * @brief Default done() handler: does nothing.
+ *
+ * @param[in] data      Transfer (unused).
+ * @param[in] reader    Reader (unused).
+ * @param[in] premature Non-zero if the transfer ended early (unused).
+ */
 void Curl_creader_def_done(struct Curl_easy *data,
                            struct Curl_creader *reader, int premature)
 {
@@ -626,19 +1020,31 @@ void Curl_creader_def_done(struct Curl_easy *data,
   (void)premature;
 }
 
+/**
+ * @brief Context of the "cr-in" reader that feeds from the read callback.
+ * @internal
+ */
 struct cr_in_ctx {
-  struct Curl_creader super;
-  curl_read_callback read_cb;
-  void *cb_user_data;
-  curl_off_t total_len;
-  curl_off_t read_len;
-  CURLcode error_result;
-  BIT(seen_eos);
-  BIT(errored);
-  BIT(has_used_cb);
-  BIT(is_paused);
+  struct Curl_creader super;  ///< base reader, must be first
+  curl_read_callback read_cb;  ///< application read callback
+  void *cb_user_data;  ///< user pointer for read_cb
+  curl_off_t total_len;  ///< bytes to upload, -1 if unknown
+  curl_off_t read_len;  ///< bytes read so far
+  CURLcode error_result;  ///< sticky error to return
+  BIT(seen_eos);  ///< end of input reached
+  BIT(errored);  ///< a read failed, error is sticky
+  BIT(has_used_cb);  ///< callback was invoked once
+  BIT(is_paused);  ///< callback returned PAUSE
 };
 
+/**
+ * @brief Initialize the cr-in reader from the transfer's read callback.
+ * @internal
+ *
+ * @param[in]     data   Transfer providing fread_func and the user pointer.
+ * @param[in,out] reader Reader, its ctx is a struct cr_in_ctx.
+ * @return CURLE_OK always.
+ */
 static CURLcode cr_in_init(struct Curl_easy *data, struct Curl_creader *reader)
 {
   struct cr_in_ctx *ctx = reader->ctx;
@@ -649,7 +1055,26 @@ static CURLcode cr_in_init(struct Curl_easy *data, struct Curl_creader *reader)
   return CURLE_OK;
 }
 
-/* Real client reader to installed client callbacks. */
+/**
+ * @brief Real client reader that calls the installed read callback.
+ * @internal
+ *
+ * Respects a known total length, remembers EOS and errors (an error is
+ * returned again on every later call), and handles the special callback
+ * return values CURL_READFUNC_ABORT and CURL_READFUNC_PAUSE.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_in_ctx.
+ * @param[out]    buf    Buffer receiving data.
+ * @param[in]     blen   Size of buf.
+ * @param[out]    pnread Bytes read.
+ * @param[out]    peos   TRUE when the end of the input was reached.
+ * @return CURLE_OK on success, also when the transfer got paused.
+ * @return CURLE_READ_ERROR on premature EOF, an invalid callback return
+ *         value or PAUSE for protocols that cannot pause.
+ * @return CURLE_ABORTED_BY_CALLBACK if the callback returned
+ *         CURL_READFUNC_ABORT.
+ */
 static CURLcode cr_in_read(struct Curl_easy *data,
                            struct Curl_creader *reader,
                            char *buf, size_t blen,
@@ -750,6 +1175,14 @@ static CURLcode cr_in_read(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief cr-in needs_rewind(): TRUE once the callback has been used.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader, ctx is a struct cr_in_ctx.
+ * @return TRUE if the read callback was ever invoked, else FALSE.
+ */
 static bool cr_in_needs_rewind(struct Curl_easy *data,
                                struct Curl_creader *reader)
 {
@@ -758,6 +1191,14 @@ static bool cr_in_needs_rewind(struct Curl_easy *data,
   return (bool)ctx->has_used_cb;
 }
 
+/**
+ * @brief cr-in total_length(): the announced upload size.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader, ctx is a struct cr_in_ctx.
+ * @return Remaining total length in bytes, or -1 if unknown.
+ */
 static curl_off_t cr_in_total_length(struct Curl_easy *data,
                                      struct Curl_creader *reader)
 {
@@ -766,6 +1207,22 @@ static curl_off_t cr_in_total_length(struct Curl_easy *data,
   return ctx->total_len;
 }
 
+/**
+ * @brief cr-in resume_from(): skip the first bytes of the input.
+ * @internal
+ *
+ * Uses the seek callback if set. If seeking is impossible, the bytes are
+ * read and discarded through the read callback. The total length is
+ * reduced by the offset.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_in_ctx.
+ * @param[in]     offset Number of bytes to skip.
+ * @return CURLE_OK on success.
+ * @return CURLE_READ_ERROR if reading already started, seeking failed or
+ *         the input is shorter than offset.
+ * @return CURLE_PARTIAL_FILE if nothing is left to upload after skipping.
+ */
 static CURLcode cr_in_resume_from(struct Curl_easy *data,
                                   struct Curl_creader *reader,
                                   curl_off_t offset)
@@ -831,6 +1288,18 @@ static CURLcode cr_in_resume_from(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-in rewind: reposition the input at its start.
+ * @internal
+ *
+ * Tries, in order, the seek callback, the ioctl callback, and fseek() when
+ * the default fread() on a FILE stream is in use.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_in_ctx.
+ * @return CURLE_OK on success, or when the callback was never used.
+ * @return CURLE_SEND_FAIL_REWIND if rewinding was not possible.
+ */
 static CURLcode cr_in_rewind(struct Curl_easy *data,
                              struct Curl_creader *reader)
 {
@@ -894,6 +1363,15 @@ static CURLcode cr_in_rewind(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-in cntrl(): handle REWIND, UNPAUSE and CLEAR_EOS.
+ * @internal
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_in_ctx.
+ * @param[in]     opcode Control operation; unknown ones are ignored.
+ * @return CURLE_OK, or the result of the rewind for CURL_CRCNTRL_REWIND.
+ */
 static CURLcode cr_in_cntrl(struct Curl_easy *data,
                             struct Curl_creader *reader,
                             Curl_creader_cntrl opcode)
@@ -915,6 +1393,14 @@ static CURLcode cr_in_cntrl(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-in is_paused(): the callback asked to pause.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader, ctx is a struct cr_in_ctx.
+ * @return TRUE if the last read returned CURL_READFUNC_PAUSE.
+ */
 static bool cr_in_is_paused(struct Curl_easy *data,
                             struct Curl_creader *reader)
 {
@@ -923,6 +1409,10 @@ static bool cr_in_is_paused(struct Curl_easy *data,
   return (bool)ctx->is_paused;
 }
 
+/**
+ * @brief Type descriptor of the callback reader ("cr-in").
+ * @internal
+ */
 static const struct Curl_crtype cr_in = {
   "cr-in",
   cr_in_init,
@@ -937,6 +1427,22 @@ static const struct Curl_crtype cr_in = {
   sizeof(struct cr_in_ctx)
 };
 
+/**
+ * @brief Create a client reader using the given type handler.
+ *
+ * Allocates a zeroed instance of crt->creader_size bytes and calls the
+ * type's do_init().
+ *
+ * @param[out] preader Receives the new reader, or NULL on failure.
+ * @param[in]  data    Transfer.
+ * @param[in]  crt     Reader type, must outlive the reader.
+ * @param[in]  phase   Phase in which the reader is to run.
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY if allocation failed, or the error returned
+ *         by do_init() (the instance is freed in that case).
+ * @note The caller owns the reader until it is added to a stack.
+ * @see Curl_creader_free()
+ */
 CURLcode Curl_creader_create(struct Curl_creader **preader,
                              struct Curl_easy *data,
                              const struct Curl_crtype *crt,
@@ -964,6 +1470,13 @@ out:
   return result;
 }
 
+/**
+ * @brief Close and free a reader that is not in a stack.
+ *
+ * @param[in] data   Transfer.
+ * @param[in] reader Reader to destroy, may be NULL.
+ * @warning The reader is not unlinked from any stack.
+ */
 void Curl_creader_free(struct Curl_easy *data, struct Curl_creader *reader)
 {
   if(reader) {
@@ -972,14 +1485,26 @@ void Curl_creader_free(struct Curl_easy *data, struct Curl_creader *reader)
   }
 }
 
+/**
+ * @brief Context of the line-conversion reader "cr-lineconv".
+ * @internal
+ */
 struct cr_lc_ctx {
-  struct Curl_creader super;
-  struct bufq buf;
+  struct Curl_creader super;  ///< base reader, must be first
+  struct bufq buf;  ///< converted data not yet delivered
   BIT(read_eos);  /* we read an EOS from the next reader */
   BIT(eos);       /* we have returned an EOS */
   BIT(prev_cr);   /* the last byte was a CR */
 };
 
+/**
+ * @brief Initialize the line-conversion reader's buffer queue.
+ * @internal
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] reader Reader, ctx is a struct cr_lc_ctx.
+ * @return CURLE_OK always.
+ */
 static CURLcode cr_lc_init(struct Curl_easy *data, struct Curl_creader *reader)
 {
   struct cr_lc_ctx *ctx = reader->ctx;
@@ -988,6 +1513,13 @@ static CURLcode cr_lc_init(struct Curl_easy *data, struct Curl_creader *reader)
   return CURLE_OK;
 }
 
+/**
+ * @brief Free the line-conversion reader's buffer queue.
+ * @internal
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] reader Reader, ctx is a struct cr_lc_ctx.
+ */
 static void cr_lc_close(struct Curl_easy *data, struct Curl_creader *reader)
 {
   struct cr_lc_ctx *ctx = reader->ctx;
@@ -995,7 +1527,24 @@ static void cr_lc_close(struct Curl_easy *data, struct Curl_creader *reader)
   Curl_bufq_free(&ctx->buf);
 }
 
-/* client reader doing line end conversions. */
+/**
+ * @brief Client reader doing line end conversions (LF to CRLF).
+ * @internal
+ *
+ * Reads from the next reader. If the data has no LF it is passed through,
+ * otherwise it is copied into an internal queue with each lone LF replaced
+ * by CRLF, and served from there. An LF that already follows a CR is kept.
+ * The CR state is tracked across calls.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_lc_ctx.
+ * @param[out]    buf    Buffer receiving data.
+ * @param[in]     blen   Size of buf.
+ * @param[out]    pnread Bytes read.
+ * @param[out]    peos   TRUE when all data was delivered.
+ * @return CURLE_OK on success, else the error of the next reader or of the
+ *         buffer queue (e.g. CURLE_OUT_OF_MEMORY).
+ */
 static CURLcode cr_lc_read(struct Curl_easy *data,
                            struct Curl_creader *reader,
                            char *buf, size_t blen,
@@ -1076,6 +1625,14 @@ out:
   return result;
 }
 
+/**
+ * @brief cr-lineconv total_length(): size changes, so it is unknown.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @return -1 always.
+ */
 static curl_off_t cr_lc_total_length(struct Curl_easy *data,
                                      struct Curl_creader *reader)
 {
@@ -1085,6 +1642,10 @@ static curl_off_t cr_lc_total_length(struct Curl_easy *data,
   return -1;
 }
 
+/**
+ * @brief Type descriptor of the line-conversion reader ("cr-lineconv").
+ * @internal
+ */
 static const struct Curl_crtype cr_lc = {
   "cr-lineconv",
   cr_lc_init,
@@ -1099,6 +1660,13 @@ static const struct Curl_crtype cr_lc = {
   sizeof(struct cr_lc_ctx)
 };
 
+/**
+ * @brief Add the line-conversion reader to the reader stack.
+ * @internal
+ *
+ * @param[in,out] data Transfer.
+ * @return CURLE_OK on success, else the creation or insert error.
+ */
 static CURLcode cr_lc_add(struct Curl_easy *data)
 {
   struct Curl_creader *reader = NULL;
@@ -1113,6 +1681,20 @@ static CURLcode cr_lc_add(struct Curl_easy *data)
   return result;
 }
 
+/**
+ * @brief Install a client reader as the base of a new reader stack.
+ * @internal
+ *
+ * Adds line-end conversion when CURLOPT_CRLF (or ASCII preference) is
+ * active and the upload is not known to be empty.
+ *
+ * @param[in,out] data Transfer, its reader stack must be empty.
+ * @param[in]     r    Reader of phase CURL_CR_CLIENT; ownership moves to
+ *                     the stack.
+ * @return CURLE_OK on success.
+ * @return The error from adding the conversion reader. The stack is
+ *         cleared (and r freed) in that case.
+ */
 static CURLcode do_init_reader_stack(struct Curl_easy *data,
                                      struct Curl_creader *r)
 {
@@ -1148,6 +1730,17 @@ static CURLcode do_init_reader_stack(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Set the client reader to use the application read callback.
+ *
+ * Replaces any existing reader stack.
+ *
+ * @param[in,out] data Transfer.
+ * @param[in]     len  Total upload size in bytes, or -1 if unknown.
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY or another error from creating the readers.
+ * @see Curl_creader_set_buf(), Curl_creader_set_null()
+ */
 CURLcode Curl_creader_set_fread(struct Curl_easy *data, curl_off_t len)
 {
   CURLcode result;
@@ -1168,6 +1761,19 @@ out:
   return result;
 }
 
+/**
+ * @brief Add a reader to the transfer's reader stack.
+ *
+ * If there is no stack yet, the default callback reader is installed first
+ * using data->state.infilesize. The reader is inserted as first of its
+ * phase.
+ *
+ * @param[in,out] data   Transfer.
+ * @param[in]     reader Initialized reader, ownership moves to the stack
+ *                       on success.
+ * @return CURLE_OK on success, otherwise an error; reader stays owned by
+ *         the caller then.
+ */
 CURLcode Curl_creader_add(struct Curl_easy *data,
                           struct Curl_creader *reader)
 {
@@ -1189,6 +1795,14 @@ CURLcode Curl_creader_add(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Replace the reader stack with the given client reader.
+ *
+ * @param[in,out] data Transfer.
+ * @param[in]     r    Reader of phase CURL_CR_CLIENT; ownership moves to
+ *                     the transfer.
+ * @return CURLE_OK on success, else the error of do_init_reader_stack().
+ */
 CURLcode Curl_creader_set(struct Curl_easy *data, struct Curl_creader *r)
 {
   DEBUGASSERT(r);
@@ -1199,6 +1813,23 @@ CURLcode Curl_creader_set(struct Curl_easy *data, struct Curl_creader *r)
   return do_init_reader_stack(data, r);
 }
 
+/**
+ * @brief Read upload data through the client reader stack.
+ *
+ * Creates the default callback reader when none is set, starts the upload
+ * rate limiter on first call and caps blen to the currently available
+ * quota. If the quota is used up, returns success with no data and eos
+ * FALSE.
+ *
+ * @param[in,out] data  Transfer.
+ * @param[out]    buf   Buffer receiving data, must not be NULL.
+ * @param[in]     blen  Size of buf, must be non-zero.
+ * @param[out]    nread Bytes read, may be 0.
+ * @param[out]    eos   TRUE when the upload data is exhausted.
+ * @return CURLE_OK on success.
+ * @return Any error of the reader stack, e.g. CURLE_READ_ERROR or
+ *         CURLE_ABORTED_BY_CALLBACK.
+ */
 CURLcode Curl_client_read(struct Curl_easy *data, char *buf, size_t blen,
                           size_t *nread, bool *eos)
 {
@@ -1240,6 +1871,12 @@ out:
   return result;
 }
 
+/**
+ * @brief Tell if any reader needs a rewind before the next request.
+ *
+ * @param[in] data Transfer.
+ * @return TRUE if at least one reader reports it consumed data.
+ */
 bool Curl_creader_needs_rewind(struct Curl_easy *data)
 {
   struct Curl_creader *reader = data->req.reader.stack;
@@ -1253,6 +1890,18 @@ bool Curl_creader_needs_rewind(struct Curl_easy *data)
   return FALSE;
 }
 
+/**
+ * @brief cr-null read(): deliver no data and signal EOS.
+ * @internal
+ *
+ * @param[in]  data   Transfer (unused).
+ * @param[in]  reader Reader (unused).
+ * @param[out] buf    Unused.
+ * @param[in]  blen   Unused.
+ * @param[out] pnread Set to 0.
+ * @param[out] peos   Set to TRUE.
+ * @return CURLE_OK always.
+ */
 static CURLcode cr_null_read(struct Curl_easy *data,
                              struct Curl_creader *reader,
                              char *buf, size_t blen,
@@ -1267,6 +1916,14 @@ static CURLcode cr_null_read(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-null total_length(): always empty.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader (unused).
+ * @return 0 always.
+ */
 static curl_off_t cr_null_total_length(struct Curl_easy *data,
                                        struct Curl_creader *reader)
 {
@@ -1276,6 +1933,10 @@ static curl_off_t cr_null_total_length(struct Curl_easy *data,
   return 0;
 }
 
+/**
+ * @brief Type descriptor of the empty reader ("cr-null").
+ * @internal
+ */
 static const struct Curl_crtype cr_null = {
   "cr-null",
   Curl_creader_def_init,
@@ -1290,6 +1951,14 @@ static const struct Curl_crtype cr_null = {
   sizeof(struct Curl_creader)
 };
 
+/**
+ * @brief Set the client reader to one that provides no data at all.
+ *
+ * Replaces any existing reader stack.
+ *
+ * @param[in,out] data Transfer.
+ * @return CURLE_OK on success, else the creation error.
+ */
 CURLcode Curl_creader_set_null(struct Curl_easy *data)
 {
   struct Curl_creader *r;
@@ -1303,13 +1972,29 @@ CURLcode Curl_creader_set_null(struct Curl_easy *data)
   return do_init_reader_stack(data, r);
 }
 
+/**
+ * @brief Context of the "cr-buf" reader that serves a memory buffer.
+ * @internal
+ */
 struct cr_buf_ctx {
-  struct Curl_creader super;
-  const char *buf;
-  size_t blen;
-  size_t index;
+  struct Curl_creader super;  ///< base reader, must be first
+  const char *buf;  ///< caller owned data, not copied
+  size_t blen;  ///< bytes remaining in buf
+  size_t index;  ///< read position in buf
 };
 
+/**
+ * @brief cr-buf read(): copy from the memory buffer.
+ * @internal
+ *
+ * @param[in,out] data   Transfer (used for tracing).
+ * @param[in,out] reader Reader, ctx is a struct cr_buf_ctx.
+ * @param[out]    buf    Buffer receiving data.
+ * @param[in]     blen   Size of buf.
+ * @param[out]    pnread Bytes copied.
+ * @param[out]    peos   TRUE when the whole buffer has been delivered.
+ * @return CURLE_OK always.
+ */
 static CURLcode cr_buf_read(struct Curl_easy *data,
                             struct Curl_creader *reader,
                             char *buf, size_t blen,
@@ -1335,6 +2020,14 @@ static CURLcode cr_buf_read(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-buf needs_rewind(): TRUE once data has been read.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader, ctx is a struct cr_buf_ctx.
+ * @return TRUE if the read position is past the start.
+ */
 static bool cr_buf_needs_rewind(struct Curl_easy *data,
                                 struct Curl_creader *reader)
 {
@@ -1343,6 +2036,15 @@ static bool cr_buf_needs_rewind(struct Curl_easy *data,
   return ctx->index > 0;
 }
 
+/**
+ * @brief cr-buf cntrl(): rewind resets the read position.
+ * @internal
+ *
+ * @param[in]     data   Transfer (unused).
+ * @param[in,out] reader Reader, ctx is a struct cr_buf_ctx.
+ * @param[in]     opcode Control operation; only REWIND has an effect.
+ * @return CURLE_OK always.
+ */
 static CURLcode cr_buf_cntrl(struct Curl_easy *data,
                              struct Curl_creader *reader,
                              Curl_creader_cntrl opcode)
@@ -1359,6 +2061,14 @@ static CURLcode cr_buf_cntrl(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief cr-buf total_length(): size of the memory buffer.
+ * @internal
+ *
+ * @param[in] data   Transfer (unused).
+ * @param[in] reader Reader, ctx is a struct cr_buf_ctx.
+ * @return Remaining buffer length in bytes.
+ */
 static curl_off_t cr_buf_total_length(struct Curl_easy *data,
                                       struct Curl_creader *reader)
 {
@@ -1367,6 +2077,17 @@ static curl_off_t cr_buf_total_length(struct Curl_easy *data,
   return (curl_off_t)ctx->blen;
 }
 
+/**
+ * @brief cr-buf resume_from(): skip the first bytes of the buffer.
+ * @internal
+ *
+ * @param[in]     data   Transfer.
+ * @param[in,out] reader Reader, ctx is a struct cr_buf_ctx.
+ * @param[in]     offset Number of bytes to skip.
+ * @return CURLE_OK on success.
+ * @return CURLE_READ_ERROR if data was already read or offset is larger
+ *         than the buffer.
+ */
 static CURLcode cr_buf_resume_from(struct Curl_easy *data,
                                    struct Curl_creader *reader,
                                    curl_off_t offset)
@@ -1390,6 +2111,10 @@ static CURLcode cr_buf_resume_from(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Type descriptor of the memory buffer reader ("cr-buf").
+ * @internal
+ */
 static const struct Curl_crtype cr_buf = {
   "cr-buf",
   Curl_creader_def_init,
@@ -1404,6 +2129,17 @@ static const struct Curl_crtype cr_buf = {
   sizeof(struct cr_buf_ctx)
 };
 
+/**
+ * @brief Set the client reader to serve data from a memory buffer.
+ *
+ * Replaces any existing reader stack.
+ *
+ * @param[in,out] data Transfer.
+ * @param[in]     buf  Data to upload.
+ * @param[in]     blen Length of buf.
+ * @return CURLE_OK on success, else the creation error.
+ * @warning buf is not copied and must stay valid while the transfer reads.
+ */
 CURLcode Curl_creader_set_buf(struct Curl_easy *data,
                               const char *buf, size_t blen)
 {
@@ -1426,12 +2162,27 @@ out:
   return result;
 }
 
+/**
+ * @brief Get the total upload length as seen after all readers.
+ *
+ * @param[in] data Transfer.
+ * @return Length in bytes, or -1 if unknown or there is no reader.
+ * @see Curl_creader_client_length()
+ */
 curl_off_t Curl_creader_total_length(struct Curl_easy *data)
 {
   struct Curl_creader *r = data->req.reader.stack;
   return r ? r->crt->total_length(data, r) : -1;
 }
 
+/**
+ * @brief Get the upload length of the client (phase CLIENT) reader.
+ *
+ * Unlike Curl_creader_total_length() this ignores converting readers.
+ *
+ * @param[in] data Transfer.
+ * @return Length in bytes, or -1 if unknown or there is no such reader.
+ */
 curl_off_t Curl_creader_client_length(struct Curl_easy *data)
 {
   struct Curl_creader *r = data->req.reader.stack;
@@ -1440,6 +2191,12 @@ curl_off_t Curl_creader_client_length(struct Curl_easy *data)
   return r ? r->crt->total_length(data, r) : -1;
 }
 
+/**
+ * @brief Tell all readers that the transfer was unpaused.
+ *
+ * @param[in,out] data Transfer.
+ * @return CURLE_OK, or the first error from a reader's cntrl().
+ */
 CURLcode Curl_creader_unpause(struct Curl_easy *data)
 {
   struct Curl_creader *reader = data->req.reader.stack;
@@ -1455,6 +2212,12 @@ CURLcode Curl_creader_unpause(struct Curl_easy *data)
   return result;
 }
 
+/**
+ * @brief Tell if any reader is paused.
+ *
+ * @param[in] data Transfer.
+ * @return TRUE if at least one reader reports being paused.
+ */
 bool Curl_creader_is_paused(struct Curl_easy *data)
 {
   struct Curl_creader *reader = data->req.reader.stack;
@@ -1467,6 +2230,12 @@ bool Curl_creader_is_paused(struct Curl_easy *data)
   return FALSE;
 }
 
+/**
+ * @brief Notify all readers that the upload is done.
+ *
+ * @param[in,out] data      Transfer.
+ * @param[in]     premature Non-zero if the transfer ended early.
+ */
 void Curl_creader_done(struct Curl_easy *data, int premature)
 {
   struct Curl_creader *reader = data->req.reader.stack;
@@ -1476,6 +2245,14 @@ void Curl_creader_done(struct Curl_easy *data, int premature)
   }
 }
 
+/**
+ * @brief Find a reader in the stack by its type descriptor.
+ *
+ * @param[in] data Transfer.
+ * @param[in] crt  Type descriptor to look for (compared by address).
+ * @return The first matching reader, or NULL if none.
+ * @note The returned pointer is owned by the stack.
+ */
 struct Curl_creader *Curl_creader_get_by_type(struct Curl_easy *data,
                                               const struct Curl_crtype *crt)
 {

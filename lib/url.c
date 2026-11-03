@@ -21,6 +21,25 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file
+ * @brief URL handling and connection setup for transfers.
+ *
+ * This file hosts the glue between a Curl_easy handle and the connection it
+ * uses: parsing the transfer URL into an origin and credentials, creating a
+ * template ("needle") connection, matching it against the connection pool for
+ * reuse, and finally attaching an existing or new connection to the transfer.
+ * It also contains Curl_open()/Curl_close() (handle life cycle), the default
+ * option values (Curl_init_userdefined()) and small helpers such as per
+ * connection metadata storage.
+ *
+ * @note Everything named url_* or *_internals is private to this file.
+ * @see urlapi.c for the CURLU URL parser, conncache.c for the pool.
+ *
+ * @defgroup url_conn_reuse Connection reuse matching
+ * @brief The url_match_* predicates deciding if a pooled connection fits.
+ * @internal
+ */
 #include "curl_setup.h"
 
 #ifdef HAVE_NETINET_IN_H
@@ -122,20 +141,26 @@
  * than a few bytes to play with. Do not let it become too small or bad things
  * will happen.
  */
+/**
+ * @brief Compile time sanity check of the receive buffer size.
+ *
+ * Code such as the chunked decoder assumes the buffer holds more than a few
+ * bytes. Building with a too small READBUFFER_SIZE is rejected here.
+ */
 #if READBUFFER_SIZE < READBUFFER_MIN
 # error READBUFFER_SIZE is too small
 #endif
 
-/*
- * get_protocol_family()
+/**
+ * @brief Return the protocol family of a scheme.
+ * @internal
  *
- * This is used to return the protocol family for a given protocol.
+ * Gives the family as a single bit protocol identifier, used to decide if
+ * two different schemes (e.g. imap and imaps) belong together.
  *
- * Parameters:
- *
- * 's'  [in]  - struct Curl_scheme pointer.
- *
- * Returns the family as a single bit protocol identifier.
+ * @param[in] s  scheme to query, must not be NULL and have a family set.
+ * @return the family bit of the scheme (never 0).
+ * @pre @p s != NULL and @p s->family != 0 (checked by DEBUGASSERT).
  */
 static curl_prot_t get_protocol_family(const struct Curl_scheme *s)
 {
@@ -144,6 +169,18 @@ static curl_prot_t get_protocol_family(const struct Curl_scheme *s)
   return s->family;
 }
 
+/**
+ * @brief Free all dynamic data stored in the "set" part of a handle.
+ *
+ * Releases the password-like strings (cleared securely), the generic string
+ * set, copied POST fields, blobs, referer and URL buffers, the mime post
+ * structure and the cookie list set via options.
+ *
+ * @param[in,out] data  transfer handle whose data->set members get released.
+ * @note Pointers are reset to NULL, so calling it again is harmless.
+ * @warning Does not free data itself nor stdio streams in data->set.
+ * @see Curl_init_userdefined(), Curl_close()
+ */
 void Curl_freeset(struct Curl_easy *data)
 {
   /* Free all dynamic strings stored in the data->set substructure. */
@@ -177,7 +214,16 @@ void Curl_freeset(struct Curl_easy *data)
 #endif
 }
 
-/* free the URL pieces */
+/**
+ * @brief Free the URL pieces held by the transfer.
+ * @internal
+ *
+ * Releases the cached options, path and query strings and the CURLU handle
+ * in data->state.
+ *
+ * @param[in,out] data  transfer handle, state.up and state.uh are reset.
+ * @post data->state.uh == NULL and all urlpieces members are NULL.
+ */
 static void up_free(struct Curl_easy *data)
 {
   struct urlpieces *up = &data->state.up;
@@ -188,11 +234,21 @@ static void up_free(struct Curl_easy *data)
   data->state.uh = NULL;
 }
 
-/*
- * This is the internal function curl_easy_cleanup() calls. This should
- * cleanup and free all resources associated with this Curl_easy.
+/**
+ * @brief Destroy a transfer handle and free all its resources.
  *
- * We ignore SIGPIPE when this is called from curl_easy_cleanup.
+ * This is the internal function curl_easy_cleanup() calls. It detaches the
+ * handle from a multi handle or a connection, stops timers, closes the TLS
+ * sessions, saves alt-svc/HSTS/cookie state and finally zeroes and frees
+ * the handle itself. SIGPIPE is ignored while this runs when it is called
+ * from curl_easy_cleanup().
+ *
+ * @param[in,out] datap  address of the handle pointer. It is set to NULL
+ *                       before any work is done.
+ * @return CURLE_OK always, also when @p datap or *datap is NULL.
+ * @warning The handle must not be used afterwards. If it is part of a multi
+ *          handle it gets removed from it first.
+ * @see Curl_open()
  */
 CURLcode Curl_close(struct Curl_easy **datap)
 {
@@ -304,9 +360,18 @@ CURLcode Curl_close(struct Curl_easy **datap)
   return CURLE_OK;
 }
 
-/*
- * Initialize the UserDefined fields within a Curl_easy.
- * This may be safely called on a new or existing Curl_easy.
+/**
+ * @brief Set the user-modifiable options to their defaults.
+ *
+ * Initializes data->set (UserDefined): stdio streams, write/read callbacks,
+ * default timeouts, auth methods, TLS minimums, TCP keepalive, buffer sizes
+ * and per-protocol defaults. Fields guarded by feature macros are only
+ * touched when the feature is built in.
+ *
+ * @param[in,out] data  transfer handle, may be new or already in use.
+ * @note Safe to call on a new or an existing Curl_easy, e.g. from
+ *       curl_easy_reset().
+ * @see Curl_freeset()
  */
 void Curl_init_userdefined(struct Curl_easy *data)
 {
@@ -431,8 +496,16 @@ void Curl_init_userdefined(struct Curl_easy *data)
 #endif
 }
 
-/* easy->meta_hash destructor. Should never be called as elements
- * MUST be added with their own destructor */
+/**
+ * @brief Destructor callback for data->meta_hash entries.
+ * @internal
+ *
+ * Elements must be added with their own destructor, so this default one
+ * should never be called with a non-NULL pointer.
+ *
+ * @param[in] p  stored element (unused, asserted to be NULL).
+ * @warning Only reached on programming errors.
+ */
 static void easy_meta_freeentry(void *p)
 {
   (void)p;
@@ -443,11 +516,17 @@ static void easy_meta_freeentry(void *p)
 }
 
 /**
- * Curl_open()
+ * @brief Allocate and initialize a new transfer handle.
  *
- * @param curl is a pointer to a Curl_easy pointer that gets set by this
- * function.
- * @return CURLcode
+ * Callocs a struct Curl_easy, sets the magic number, invalid ids, buffers
+ * (dynbuf, bufref), the request and info structs, and applies the default
+ * options.
+ *
+ * @param[out] curl  receives the new handle on success, untouched on error.
+ * @return CURLE_OK on success
+ * @retval CURLE_OUT_OF_MEMORY the handle could not be allocated.
+ * @post On success *curl is owned by the caller, free with Curl_close().
+ * @see Curl_close(), Curl_init_userdefined()
  */
 CURLcode Curl_open(struct Curl_easy **curl)
 {
@@ -490,6 +569,19 @@ CURLcode Curl_open(struct Curl_easy **curl)
   return CURLE_OK;
 }
 
+/**
+ * @brief Free a connection and everything it owns.
+ *
+ * Calls the protocol disconnect handler (unless the shutdown handler already
+ * did), discards all connection filters, unlinks peers and credentials,
+ * frees option strings and the metadata hash, then the struct itself.
+ *
+ * @param[in] data  transfer used for callbacks and tracing.
+ * @param[in] conn  connection to free, must not be NULL.
+ * @warning @p conn is invalid after this call. It must already be detached
+ *          from the connection pool and from all transfers.
+ * @see allocate_conn()
+ */
 void Curl_conn_free(struct Curl_easy *data, struct connectdata *conn)
 {
   int8_t i;
@@ -526,11 +618,17 @@ void Curl_conn_free(struct Curl_easy *data, struct connectdata *conn)
   curlx_free(conn); /* free all the connection oriented data */
 }
 
-/*
- * xfer_may_multiplex()
+/**
+ * @brief Tell if a transfer could be run on a multiplexed connection.
+ * @internal
  *
- * Return a TRUE, iff the transfer can be done over an (appropriate)
- * multiplexed connection.
+ * True for HTTP family schemes when the multi handle wants multiplexing,
+ * HTTP/2 or newer is allowed, and the connection is not closing.
+ *
+ * @param[in] data  transfer with the HTTP negotiation state.
+ * @param[in] conn  (template) connection to be used.
+ * @return TRUE if multiplexing is possible, FALSE otherwise (always FALSE
+ *         when HTTP is disabled).
  */
 static bool xfer_may_multiplex(const struct Curl_easy *data,
                                const struct connectdata *conn)
@@ -553,6 +651,14 @@ static bool xfer_may_multiplex(const struct Curl_easy *data,
 }
 
 #ifndef CURL_DISABLE_PROXY
+/**
+ * @brief Compare two proxy descriptions for connection reuse.
+ * @internal
+ *
+ * @param[in] data    proxy info of an existing connection.
+ * @param[in] needle  proxy info the transfer wants.
+ * @return TRUE if proxy type, destination and credentials are all the same.
+ */
 static bool proxy_info_matches(const struct proxy_info *data,
                                const struct proxy_info *needle)
 {
@@ -566,6 +672,14 @@ static bool proxy_info_matches(const struct proxy_info *data,
 #endif
 
 #ifdef USE_SSH
+/**
+ * @brief Compare the SSH key settings of two connections.
+ * @internal
+ *
+ * @param[in] one  first connection.
+ * @param[in] two  second connection.
+ * @return TRUE if both have SSH state and equal private and public keys.
+ */
 static bool ssh_config_matches(struct connectdata *one,
                                struct connectdata *two)
 {
@@ -578,29 +692,63 @@ static bool ssh_config_matches(struct connectdata *one,
 }
 #endif
 
+/**
+ * @brief State of one search for a reusable connection in the pool.
+ * @internal
+ *
+ * Filled by url_match_init(), consulted by the url_match_* predicates while
+ * the pool is scanned and finally evaluated by url_match_result().
+ * @ingroup url_conn_reuse
+ */
 struct url_conn_match {
+  /** The matching connection once found, else NULL. */
   struct connectdata *found;
+  /** Transfer looking for a connection. */
   struct Curl_easy *data;
+  /** Template connection describing the wanted one. */
   struct connectdata *needle;
+  /** Timestamp used for age and health checks. */
   struct curltime now;
+  /** Shallow TLS config of the needle for matching. */
   struct ssl_filter_config ssl_config;
 #ifndef CURL_DISABLE_PROXY
+  /** Shallow TLS config of the HTTPS proxy. */
   struct ssl_filter_config proxy_ssl_config;
 #endif
+  /** Transfer may share a multiplexed connection. */
   BIT(may_multiplex);
+  /** Transfer wants HTTP Negotiate authentication. */
   BIT(want_nego_http);
+  /** Transfer wants Negotiate to the HTTP proxy. */
   BIT(want_proxy_nego_http);
   BIT(may_tls); /* May upgrade clear-text connection to TLS, can only reuse
                  * connections that have matching TLS configuration.
                  * Always TRUE if `req_tls` is TRUE. */
   BIT(require_tls); /* Requires TLS use from a clear-text start, can only
                  * reuse connections that have TLS. */
+  /** Wait for a connection to finish multiplex negotiation. */
   BIT(wait_pipe);
+  /** Saw a candidate that is not fully connected yet. */
   BIT(seen_pending_conn);
+  /** Saw a busy connection that cannot multiplex. */
   BIT(seen_single_use_conn);
+  /** Saw a busy connection that can multiplex. */
   BIT(seen_multiplex_conn);
 };
 
+/**
+ * @brief Check general connect settings of a candidate connection.
+ * @internal
+ *
+ * Rejects connect-only, closing and no-reuse connections, and requires
+ * matching IP version, local port/range and interface bind options. A
+ * connection using "connect to" must not be mixed with one that does not.
+ *
+ * @param[in] conn  candidate connection from the pool.
+ * @param[in] m     match state holding the needle and transfer.
+ * @return TRUE if the candidate passes, FALSE to skip it.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_connect_config(struct connectdata *conn,
                                      struct url_conn_match *m)
 {
@@ -645,6 +793,16 @@ static bool url_match_connect_config(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that a candidate is connected and not upgrading.
+ * @internal
+ *
+ * @param[in]     conn  candidate connection.
+ * @param[in,out] m     match state, seen_pending_conn is set when a
+ *                      multiplex-capable transfer meets an unfinished conn.
+ * @return TRUE if fully connected, FALSE otherwise.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_fully_connected(struct connectdata *conn,
                                       struct url_conn_match *m)
 {
@@ -664,6 +822,15 @@ static bool url_match_fully_connected(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that a busy connection belongs to the same multi handle.
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return FALSE if @p conn is in use by another multi handle, else TRUE.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_multi(struct connectdata *conn,
                             struct url_conn_match *m)
 {
@@ -675,6 +842,19 @@ static bool url_match_multi(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that a busy connection can take one more transfer.
+ * @internal
+ *
+ * Idle connections always pass. A busy one passes only if it multiplexes
+ * and the transfer may multiplex on it within the same multi handle. Records
+ * what was seen in @p m for url_match_result().
+ *
+ * @param[in]     conn  candidate connection.
+ * @param[in,out] m     match state, seen_* flags may be set.
+ * @return TRUE if usable, FALSE if the candidate must be skipped.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_multiplex_needs(struct connectdata *conn,
                                       struct url_conn_match *m)
 {
@@ -692,6 +872,16 @@ static bool url_match_multiplex_needs(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Enforce stream concurrency limits on a multiplexed candidate.
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return FALSE if the connection reached the multi handle's or the
+ *         server's MAX_CONCURRENT_STREAMS, otherwise TRUE.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_multiplex_limits(struct connectdata *conn,
                                        struct url_conn_match *m)
 {
@@ -718,6 +908,19 @@ static bool url_match_multiplex_limits(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that TLS usage of a candidate fits the wanted scheme.
+ * @internal
+ *
+ * A TLS scheme needs a TLS connection. A clear-text scheme may reuse a TLS
+ * connection only if its protocol allows it (auto-upgrade, same family) and
+ * the SSL config matches. A required STARTTLS cannot use clear-text.
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE on match, FALSE otherwise.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_ssl_use(struct connectdata *conn,
                               struct url_conn_match *m)
 {
@@ -744,6 +947,19 @@ static bool url_match_ssl_use(struct connectdata *conn,
 }
 
 #ifndef CURL_DISABLE_PROXY
+/**
+ * @brief Check that proxy settings of a candidate equal the needle's.
+ * @internal
+ *
+ * Compares origin-is-proxy, SOCKS and HTTP proxy descriptions, SOCKS5
+ * authentication state and, for HTTPS proxies, the proxy TLS config.
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE if the proxy setups are compatible, FALSE otherwise.
+ * @note With proxy support disabled this is a macro that always yields TRUE.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_proxy_use(struct connectdata *conn,
                                 struct url_conn_match *m)
 {
@@ -787,6 +1003,20 @@ static bool url_match_proxy_use(struct connectdata *conn,
 #endif
 
 #ifndef CURL_DISABLE_HTTP
+/**
+ * @brief Handle candidates whose HTTP version is not yet known.
+ * @internal
+ *
+ * If the transfer may multiplex but the connection has not seen an HTTP
+ * version yet, either ask to wait (CURLOPT_PIPEWAIT) or skip it.
+ *
+ * @param[in]     conn        candidate connection.
+ * @param[in,out] m           match state, m->found is cleared when waiting.
+ * @param[out]    pwait_pipe  set TRUE when the transfer should wait.
+ * @return TRUE to continue (or to stop the search when waiting), FALSE to
+ *         skip this candidate.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_http_multiplex(struct connectdata *conn,
                                      struct url_conn_match *m,
                                      bool *pwait_pipe)
@@ -807,6 +1037,16 @@ static bool url_match_http_multiplex(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that the HTTP version of a candidate is allowed.
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return FALSE if the connection speaks h1, h2 or h3 and the transfer's
+ *         allowed versions exclude it, otherwise TRUE.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_http_version(struct connectdata *conn,
                                    struct url_conn_match *m)
 {
@@ -844,6 +1084,15 @@ static bool url_match_http_version(struct connectdata *conn,
 #define url_match_http_version(c, m)      ((void)(c), (void)(m), TRUE)
 #endif
 
+/**
+ * @brief Check protocol specific settings (HTTP version, SSH, FTP).
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE if the protocol specific configuration matches.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_proto_config(struct connectdata *conn,
                                    struct url_conn_match *m)
 {
@@ -865,6 +1114,17 @@ static bool url_match_proto_config(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that credentials of a candidate fit the transfer.
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE if the needle credentials (or transfer credentials when the
+ *         needle has none) equal the connection's, and GSS delegation
+ *         settings agree. FALSE otherwise.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_auth(struct connectdata *conn,
                            struct url_conn_match *m)
 {
@@ -884,6 +1144,19 @@ static bool url_match_auth(struct connectdata *conn,
   return TRUE;
 }
 
+/**
+ * @brief Check that origin and "connect to" peer of a candidate match.
+ * @internal
+ *
+ * Different via-peers never match. A scheme mismatch is allowed within the
+ * same protocol family when the connection uses TLS (IMAP+STARTTLS for
+ * IMAPS, IMAPS for IMAP). Then host name and port are compared.
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE if the destinations are the same.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_destination(struct connectdata *conn,
                                   struct url_conn_match *m)
 {
@@ -904,6 +1177,15 @@ static bool url_match_destination(struct connectdata *conn,
   return Curl_peer_same_destination(m->needle->origin, conn->origin);
 }
 
+/**
+ * @brief Check that TLS options of a candidate equal the needle's.
+ * @internal
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return FALSE if TLS is wanted or possible and the SSL parameters differ.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_ssl_config(struct connectdata *conn,
                                  struct url_conn_match *m)
 {
@@ -919,6 +1201,21 @@ static bool url_match_ssl_config(struct connectdata *conn,
 }
 
 #ifdef USE_SPNEGO
+/**
+ * @brief Check Negotiate (SPNEGO) state compatibility.
+ * @internal
+ *
+ * A connection already in a Negotiate exchange is only reusable by a
+ * transfer with the same credentials and origin; the same rule applies to
+ * HTTP proxy Negotiate. Otherwise credentials bound to another origin block
+ * reuse.
+ *
+ * @param[in] conn  candidate connection.
+ * @param[in] m     match state.
+ * @return TRUE if reuse is acceptable.
+ * @note Compiled to a TRUE macro without SPNEGO.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_auth_nego(struct connectdata *conn,
                                 struct url_conn_match *m)
 {
@@ -959,6 +1256,21 @@ static bool url_match_auth_nego(struct connectdata *conn,
 #define url_match_auth_nego(c, m) ((void)(c), (void)(m), TRUE)
 #endif
 
+/**
+ * @brief Connection pool callback: does @p conn fit the wanted connection.
+ * @internal
+ *
+ * Runs all url_match_* predicates in sequence, then applies connection age
+ * and health checks.
+ *
+ * @param[in]     conn      pooled connection to evaluate.
+ * @param[in,out] userdata  struct url_conn_match for this search.
+ * @return CPOOL_MATCH_CONT to continue with the next candidate
+ * @retval CPOOL_MATCH_FOUND  usable (m->found set) or a wait is requested
+ * @retval CPOOL_MATCH_TOO_OLD  older than the max connection age
+ * @retval CPOOL_MATCH_CLOSE  idle but looks dead, pool should close it
+ * @ingroup url_conn_reuse
+ */
 static cpool_match_result url_match_conn(struct connectdata *conn,
                                          void *userdata)
 {
@@ -1033,6 +1345,19 @@ static cpool_match_result url_match_conn(struct connectdata *conn,
   return CPOOL_MATCH_FOUND;
 }
 
+/**
+ * @brief Connection pool callback run after scanning, still under lock.
+ * @internal
+ *
+ * Attaches the found connection immediately so it cannot be reaped. When
+ * nothing was found it decides whether to wait for multiplexing: no wait if
+ * only single-use connections exist, wait if CURLOPT_PIPEWAIT is set and a
+ * pending candidate was seen.
+ *
+ * @param[in,out] userdata  struct url_conn_match of the search.
+ * @return TRUE if a connection was attached, FALSE otherwise.
+ * @ingroup url_conn_reuse
+ */
 static bool url_match_result(void *userdata)
 {
   struct url_conn_match *match = userdata;
@@ -1056,14 +1381,20 @@ static bool url_match_result(void *userdata)
   return FALSE;
 }
 
-/*
- * Given a transfer and a prototype connection (needle),
- * find and attach an existing connection that matches.
+/**
+ * @brief Find and attach an existing connection that matches the needle.
+ * @internal
  *
- * Return TRUE if an existing connection was attached.
- * `waitpipe` is TRUE if no existing connection matched, but there
- * might be suitable one in the near future (common cause: multiplexing
- * capability has not been determined yet, e.g. ALPN handshake).
+ * Given a transfer and a prototype connection (needle), searches the pool
+ * for a matching connection and attaches it to the transfer.
+ *
+ * @param[in]     data    transfer to attach to.
+ * @param[in]     needle  prototype of the wanted connection.
+ * @param[in,out] m       match state, m->wait_pipe is TRUE if nothing matched
+ *                        but a suitable connection might appear soon (common
+ *                        cause: multiplexing not yet determined, e.g. ALPN).
+ * @param[in]     pnow    current time.
+ * @return TRUE if an existing connection was attached.
  */
 static bool url_attach_existing(struct Curl_easy *data,
                                 struct connectdata *needle,
@@ -1076,8 +1407,16 @@ static bool url_attach_existing(struct Curl_easy *data,
                          url_match_conn, url_match_result, m);
 }
 
-/*
- * Allocate and initialize a new connectdata object.
+/**
+ * @brief Allocate and initialize a new connectdata object.
+ * @internal
+ *
+ * Sets sockets to invalid, copies bind parameters, IP version, FTP flags,
+ * close-socket callbacks and GSS delegation from the transfer.
+ *
+ * @param[in] data  transfer providing the settings.
+ * @return the new connection, or NULL on out-of-memory.
+ * @post Caller owns the result, free with Curl_conn_free().
  */
 static struct connectdata *allocate_conn(struct Curl_easy *data)
 {
@@ -1132,6 +1471,19 @@ error:
   return NULL;
 }
 
+/**
+ * @brief Set the connection scheme if the transfer may use it.
+ * @internal
+ *
+ * The scheme must have a run handler, be in the allowed protocols and, for
+ * a redirect, in the allowed redirect protocols.
+ *
+ * @param[in]     data  transfer with the allowed protocol settings.
+ * @param[in,out] conn  connection with origin set, gets conn->scheme.
+ * @return CURLE_OK on success
+ * @retval CURLE_UNSUPPORTED_PROTOCOL not allowed, disabled or no-transfer
+ *         scheme (an error message is added).
+ */
 static CURLcode url_set_conn_scheme(struct Curl_easy *data,
                                     struct connectdata *conn)
 {
@@ -1154,6 +1506,15 @@ static CURLcode url_set_conn_scheme(struct Curl_easy *data,
   return CURLE_UNSUPPORTED_PROTOCOL;
 }
 
+/**
+ * @brief Convert a URL API error code to a CURLcode.
+ *
+ * @param[in] uc  result of a curl_url_set()/curl_url_get() call.
+ * @return CURLE_UNSUPPORTED_PROTOCOL for CURLUE_UNSUPPORTED_SCHEME
+ * @retval CURLE_OUT_OF_MEMORY for CURLUE_OUT_OF_MEMORY
+ * @retval CURLE_LOGIN_DENIED for CURLUE_USER_NOT_ALLOWED
+ * @retval CURLE_URL_MALFORMAT for every other code
+ */
 CURLcode Curl_uc_to_curlcode(CURLUcode uc)
 {
   switch(uc) {
@@ -1169,6 +1530,21 @@ CURLcode Curl_uc_to_curlcode(CURLUcode uc)
 }
 
 #ifndef CURL_DISABLE_HSTS
+/**
+ * @brief Upgrade an http:// transfer to https:// when HSTS applies.
+ * @internal
+ *
+ * Rewrites the scheme in the CURLU handle, replaces the stored URL and
+ * re-creates the origin peer.
+ *
+ * @param[in,out] data           transfer, state.url and state.origin change.
+ * @param[in,out] uh             parsed URL, scheme set to https on upgrade.
+ * @param[in]     port_override  port forced by CURLOPT_PORT or 0.
+ * @param[in]     scope_id       IPv6 scope id or 0.
+ * @return CURLE_OK if no upgrade was needed or it succeeded, otherwise the
+ *         converted URL API error or the error from Curl_peer_from_url().
+ * @note A macro returning CURLE_OK when HSTS is disabled.
+ */
 static CURLcode hsts_upgrade(struct Curl_easy *data,
                              CURLU *uh,
                              uint16_t port_override,
@@ -1203,6 +1579,13 @@ static CURLcode hsts_upgrade(struct Curl_easy *data,
 #define hsts_upgrade(x, y, z, a) CURLE_OK
 #endif
 
+/**
+ * @brief Detect control characters in a string.
+ * @internal
+ *
+ * @param[in] input  string to scan, may be NULL.
+ * @return TRUE if any byte is below 0x20, FALSE otherwise (and for NULL).
+ */
 static bool str_has_ctrl(const char *input)
 {
   if(input) {
@@ -1217,9 +1600,23 @@ static bool str_has_ctrl(const char *input)
 }
 
 #ifndef CURL_DISABLE_NETRC
-/*
+/**
+ * @brief Complete or override transfer credentials from a .netrc file.
+ * @internal
+ *
  * Override the login details from the URL with that in the CURLOPT_USERPWD
- * option or a .netrc file, if applicable.
+ * option or a .netrc file, if applicable. Credentials set with CURLOPT_*
+ * are never overridden; URL credentials are completed (or replaced when
+ * netrc is required). Updated user and password are written back to the URL.
+ *
+ * @param[in]     data    transfer, uses state.origin and netrc settings.
+ * @param[in,out] pcreds  credentials to merge with, may be replaced.
+ * @return CURLE_OK on success (also when no netrc entry is found and netrc
+ *         is optional)
+ * @retval CURLE_OUT_OF_MEMORY allocation failure.
+ * @retval CURLE_READ_ERROR netrc parse error or control codes in netrc
+ *         credentials for a protocol that forbids them.
+ * @note Only compiled without CURL_DISABLE_NETRC.
  */
 static CURLcode url_set_data_creds_netrc(struct Curl_easy *data,
                                          struct Curl_creds **pcreds)
@@ -1323,6 +1720,21 @@ out:
 }
 #endif /* CURL_DISABLE_NETRC */
 
+/**
+ * @brief Determine the credentials of the transfer.
+ * @internal
+ *
+ * Builds credentials from CURLOPT_* options (when allowed for the origin),
+ * else from the URL user and password (URL-decoded, rejecting control
+ * codes unless the protocol allows them), then applies netrc. The result
+ * is linked into data->state.creds if it changed.
+ *
+ * @param[in,out] data  transfer, state.creds is updated.
+ * @param[in]     uh    parsed URL to read user and password from.
+ * @return CURLE_OK on success
+ * @retval CURLE_BAD_FUNCTION_ARGUMENT control code in option credentials.
+ * @retval CURLE_OUT_OF_MEMORY or another conversion/netrc error.
+ */
 static CURLcode url_set_data_creds(struct Curl_easy *data, CURLU *uh)
 {
   struct Curl_creds *newcreds = NULL;
@@ -1412,6 +1824,15 @@ out:
   return result;
 }
 
+/**
+ * @brief Set origin, scheme and options of a connection from the transfer.
+ * @internal
+ *
+ * @param[in]     data  transfer with state.origin and url pieces.
+ * @param[in,out] conn  (needle) connection to fill.
+ * @return CURLE_OK on success, the error of url_set_conn_scheme(), or
+ * @retval CURLE_OUT_OF_MEMORY when copying the login options fails.
+ */
 static CURLcode url_set_conn_origin_etc(struct Curl_easy *data,
                                         struct connectdata *conn)
 {
@@ -1444,9 +1865,16 @@ out:
   return result;
 }
 
-/*
- * If we are doing a resumed transfer, we need to setup our stuff
- * properly.
+/**
+ * @brief Prepare a ranged or resumed transfer.
+ *
+ * If we are doing a resumed transfer (or CURLOPT_RANGE is set), builds
+ * the range string and enables use_range, otherwise disables it.
+ *
+ * @param[in,out] data  transfer, state.range and state.use_range change.
+ * @return CURLE_OK on success
+ * @retval CURLE_OUT_OF_MEMORY the range string could not be allocated.
+ * @post state.rangestringalloc is TRUE when a range string was allocated.
  */
 static CURLcode setup_range(struct Curl_easy *data)
 {
@@ -1475,14 +1903,21 @@ static CURLcode setup_range(struct Curl_easy *data)
   return CURLE_OK;
 }
 
-/*
- * setup_connection_internals() -
+/**
+ * @brief Set up protocol specific connection internals.
+ * @internal
  *
- * Setup connection internals specific to the requested protocol in the
- * Curl_easy. This is inited and setup before the connection is made but
- * is about the particular protocol that is to be used.
+ * Calls the scheme's setup_connection handler, then builds the lowercased
+ * "host:port" destination string ("[v6%scope]:port" for IPv6) and the
+ * IPv6 scope id. Initialized before the connection is made.
  *
- * This MUST get called after proxy magic has been figured out.
+ * @param[in]     data  transfer.
+ * @param[in,out] conn  connection, conn->destination and scope_id are set.
+ * @return CURLE_OK on success
+ * @retval CURLE_FAILED_INIT no destination peer could be determined.
+ * @retval CURLE_OUT_OF_MEMORY destination string allocation failed.
+ * @retval other error from the protocol setup_connection handler.
+ * @pre Must be called after proxy magic has been figured out.
  */
 static CURLcode setup_connection_internals(struct Curl_easy *data,
                                            struct connectdata *conn)
@@ -1531,12 +1966,11 @@ static CURLcode setup_connection_internals(struct Curl_easy *data,
   return CURLE_OK;
 }
 
-/*
- * Curl_parse_login_details()
+/**
+ * @brief Split a login string into user, password and options.
  *
- * This is used to parse a login string for username, password and options in
- * the following formats:
- *
+ * Supported formats:
+ * @code
  *   user
  *   user:password
  *   user:password;options
@@ -1546,20 +1980,17 @@ static CURLcode setup_connection_internals(struct Curl_easy *data,
  *   :password;options
  *   ;options
  *   ;options:password
+ * @endcode
  *
- * Parameters:
- *
- * login    [in]     - login string.
- * len      [in]     - length of the login string.
- * userp    [in/out] - address where a pointer to newly allocated memory
- *                     holding the user will be stored upon completion.
- * passwdp  [in/out] - address where a pointer to newly allocated memory
- *                     holding the password will be stored upon completion.
- * optionsp [in/out] - OPTIONAL address where a pointer to newly allocated
- *                     memory holding the options will be stored upon
- *                     completion.
- *
- * Returns CURLE_OK on success.
+ * @param[in]  login     login string (not necessarily NUL terminated).
+ * @param[in]  len       length of @p login.
+ * @param[out] userp     receives newly allocated user (may be empty).
+ * @param[out] passwdp   receives newly allocated password or NULL if absent.
+ * @param[out] optionsp  OPTIONAL, receives newly allocated options or NULL.
+ *                       When NULL, ';' is not treated as a separator.
+ * @return CURLE_OK on success
+ * @retval CURLE_OUT_OF_MEMORY allocation failed, outputs are untouched.
+ * @post The caller frees *userp, *passwdp and *optionsp with curlx_free().
  */
 CURLcode Curl_parse_login_details(const char *login, const size_t len,
                                   char **userp, char **passwdp,
@@ -1625,8 +2056,17 @@ error:
   return CURLE_OUT_OF_MEMORY;
 }
 
-/*
- * Set the login details so they are available in the connection
+/**
+ * @brief Set the login details so they are available in the connection.
+ * @internal
+ *
+ * Protocols that need a password get default credentials if none exist;
+ * protocols that do not take credentials per request inherit those of the
+ * transfer.
+ *
+ * @param[in]     data  transfer with state.creds and origin.
+ * @param[in,out] conn  connection, creds and creds_origin are set.
+ * @return CURLE_OK, or the error of Curl_creds_create() (out of memory).
  */
 static CURLcode url_set_conn_login(struct Curl_easy *data,
                                    struct connectdata *conn)
@@ -1650,9 +2090,19 @@ static CURLcode url_set_conn_login(struct Curl_easy *data,
   return CURLE_OK;
 }
 
-/*
- * Parses one "connect to" string in the form:
- * "HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT".
+/**
+ * @brief Parse one "connect to" string.
+ * @internal
+ *
+ * Parses "HOST:PORT:CONNECT-TO-HOST:CONNECT-TO-PORT". An empty HOST or
+ * PORT matches anything. If both match the destination, the remainder
+ * is turned into a peer.
+ *
+ * @param[in]  data          transfer.
+ * @param[in]  dest          origin peer of the request.
+ * @param[in]  conn_to_line  the entry from CURLOPT_CONNECT_TO.
+ * @param[out] pvia_dest     new peer to connect to, or NULL if no match.
+ * @return CURLE_OK, or the error of Curl_peer_from_connect_to().
  */
 static CURLcode parse_connect_to_string(struct Curl_easy *data,
                                         const struct Curl_peer *dest,
@@ -1713,9 +2163,20 @@ static CURLcode parse_connect_to_string(struct Curl_easy *data,
   return result;
 }
 
-/* With `conn->origin` known, determine if we should talk to that
- * directly or via another peer. This is the result of inspecting
- * the "connect to" slist and "alt-svc" settings. */
+/**
+ * @brief Decide whether to connect to the origin directly or via a peer.
+ * @internal
+ *
+ * With `conn->origin` known, determine if we should talk to that directly
+ * or via another peer. This is the result of inspecting the "connect to"
+ * slist and "alt-svc" settings. An Alt-Svc hit may also change the wanted
+ * HTTP versions and the transport (QUIC).
+ *
+ * @param[in]     data  transfer.
+ * @param[in,out] conn  connection, conn->via_peer may be set.
+ * @return CURLE_OK, or the error from parsing or peer creation.
+ * @pre conn->via_peer is NULL.
+ */
 static CURLcode url_set_conn_peer(struct Curl_easy *data,
                                   struct connectdata *conn)
 {
@@ -1854,8 +2315,16 @@ static CURLcode url_set_conn_peer(struct Curl_easy *data,
   return result;
 }
 
-/*
- * Adjust reused connection settings to the transfer/needle.
+/**
+ * @brief Adjust a reused connection to the transfer's needle.
+ * @internal
+ *
+ * Copies credentials, proxy credentials and the origin/via peers from the
+ * needle to the reused connection, since matching does not require the
+ * origin to be identical (proxy without tunnel, connect-to).
+ *
+ * @param[in,out] data    transfer, data->conn is the reused connection.
+ * @param[in]     needle  prototype connection of this transfer.
  */
 static void url_conn_reuse_adjust(struct Curl_easy *data,
                                   struct connectdata *needle)
@@ -1892,6 +2361,15 @@ static void url_conn_reuse_adjust(struct Curl_easy *data,
   Curl_peer_link(&conn->via_peer2, needle->via_peer2);
 }
 
+/**
+ * @brief Destructor callback for conn->meta_hash entries.
+ * @internal
+ *
+ * Same contract as easy_meta_freeentry(): never called as entries must
+ * bring their own destructor.
+ *
+ * @param[in] p  stored element (unused, asserted to be NULL).
+ */
 static void conn_meta_freeentry(void *p)
 {
   (void)p;
@@ -1901,6 +2379,21 @@ static void conn_meta_freeentry(void *p)
   DEBUGASSERT(!p);
 }
 
+/**
+ * @brief Create the template ("needle") connection for a transfer.
+ * @internal
+ *
+ * Allocates a connection and fills in origin, scheme, unix socket or
+ * connect-to/alt-svc peer, proxy, login, protocol internals and I/O
+ * callbacks, so it can be compared with pooled connections or become the
+ * connection used.
+ *
+ * @param[in]  data     transfer.
+ * @param[out] pneedle  receives the needle on success, NULL on failure.
+ * @return CURLE_OK on success, otherwise the first error met
+ *         (CURLE_OUT_OF_MEMORY, CURLE_UNSUPPORTED_PROTOCOL, ...).
+ * @post On failure the partially built connection has been freed.
+ */
 static CURLcode url_create_needle(struct Curl_easy *data,
                                   struct connectdata **pneedle)
 {
@@ -2020,6 +2513,21 @@ out:
   return result;
 }
 
+/**
+ * @brief Parse the transfer URL and set origin, URL pieces and credentials.
+ * @internal
+ *
+ * Duplicates or creates the CURLU handle, applies the default protocol if
+ * the URL has no scheme, normalizes the URL, derives the origin peer (with
+ * HSTS upgrade), remembers the initial origin, extracts path, query and
+ * options, and finally determines credentials.
+ *
+ * @param[in,out] data  transfer, state.url/up/uh/origin/creds are updated.
+ * @return CURLE_OK on success
+ * @retval CURLE_URL_MALFORMAT no URL set or it is malformed.
+ * @retval CURLE_OUT_OF_MEMORY allocation failure.
+ * @retval other conversion of URL API errors, peer or credential errors.
+ */
 static CURLcode url_set_data_origin_and_creds(struct Curl_easy *data)
 {
   CURLcode result = CURLE_OK;
@@ -2169,6 +2677,19 @@ out:
   return result;
 }
 
+/**
+ * @brief Initialize the match state for a connection search.
+ * @internal
+ *
+ * Zeroes @p m, records transfer, needle and time, derives multiplex and
+ * Negotiate wishes, TLS requirements and a shallow SSL config.
+ *
+ * @param[in]  data    transfer.
+ * @param[in]  needle  template connection.
+ * @param[out] m       match state to fill.
+ * @return CURLE_OK, or the error of the SSL filter config setup.
+ * @post Release with url_match_destroy() when the call succeeded.
+ */
 static CURLcode url_match_init(struct Curl_easy *data,
                                struct connectdata *needle,
                                struct url_conn_match *m)
@@ -2204,6 +2725,12 @@ static CURLcode url_match_init(struct Curl_easy *data,
 #endif
 }
 
+/**
+ * @brief Release the SSL configs held by a match state.
+ * @internal
+ *
+ * @param[in,out] m  match state previously set up by url_match_init().
+ */
 static void url_match_destroy(struct url_conn_match *m)
 {
   Curl_ssl_config_cleanup(&m->ssl_config);
@@ -2213,12 +2740,21 @@ static void url_match_destroy(struct url_conn_match *m)
 }
 
 /**
- * Find an existing connection for the transfer or create a new one.
- * Returns
- * - CURLE_OK on success with a connection attached to data
- * - CURLE_NO_CONNECTION_AVAILABLE when connection limits apply or when
- *   a suitable connection has not determined its multiplex capability.
- * - a fatal error
+ * @brief Find an existing connection for the transfer or create a new one.
+ * @internal
+ *
+ * Builds the needle, handles the no-network case (file:), tries to reuse
+ * a pooled connection unless fresh connects are requested, else adds the
+ * needle to the pool within the connection limits. Then prepares the
+ * transfer, range and connection filters.
+ *
+ * @param[in,out] data  transfer, data->conn is set on success.
+ * @param[in]     pnow  current time.
+ * @return CURLE_OK on success with a connection attached to data
+ * @retval CURLE_NO_CONNECTION_AVAILABLE connection limits apply or a
+ *         suitable connection has not determined its multiplex capability.
+ * @retval other a fatal error.
+ * @post On error data->conn may be unset and the needle is freed.
  */
 static CURLcode url_find_or_create_conn(struct Curl_easy *data,
                                         const struct curltime *pnow)
@@ -2396,6 +2932,22 @@ out:
   return result;
 }
 
+/**
+ * @brief Start connecting for a transfer.
+ *
+ * Resets the request, parses the URL and credentials, finds or creates the
+ * connection and starts the connection filter setup when it is new.
+ *
+ * @param[in,out] data        transfer.
+ * @param[out]    pconnected  TRUE if the transfer can proceed immediately
+ *                            (reused multiplexed or no-network connection).
+ * @return CURLE_OK on success (check @p pconnected for state)
+ * @retval CURLE_NO_CONNECTION_AVAILABLE try again later.
+ * @retval CURLE_FAILED_INIT internal inconsistency.
+ * @retval other error from URL parsing, connection setup or headers init.
+ * @post On error the connection is detached and closed unless it was reused
+ *       or still in use by other transfers.
+ */
 CURLcode Curl_connect(struct Curl_easy *data, bool *pconnected)
 {
   CURLcode result;
@@ -2460,15 +3012,18 @@ out:
   return result;
 }
 
-/*
- * Curl_init_transfer() is called each time before the transfer starts - to
- * prepare for a transfer, sometimes multiple times on the same Curl_easy.
- * Make sure nothing in here depends on stuff that is setup dynamically for
- * the transfer.
+/**
+ * @brief Prepare a transfer, called each time before it starts.
  *
- * Allow this function to get called with 'conn' set to NULL.
+ * Called to prepare for a transfer, sometimes multiple times on the same
+ * Curl_easy. Makes sure nothing in here depends on stuff that is setup
+ * dynamically for the transfer. Disables wildcard matching for protocols
+ * without support and selects HEAD for no-body requests.
+ *
+ * @param[in,out] data  transfer.
+ * @param[in]     conn  connection in use. Allowed to be NULL.
+ * @return CURLE_OK on success, else the error from Curl_req_start().
  */
-
 CURLcode Curl_init_transfer(struct Curl_easy *data, struct connectdata *conn)
 {
   CURLcode result;
@@ -2498,6 +3053,12 @@ CURLcode Curl_init_transfer(struct Curl_easy *data, struct connectdata *conn)
 
 #if defined(USE_HTTP2) || defined(USE_HTTP3)
 
+/**
+ * @brief Reset the HTTP/2 or HTTP/3 stream weight of a transfer.
+ *
+ * @param[in,out] data  transfer, state.weight is set to 0.
+ * @note Only built with HTTP/2 or HTTP/3 support.
+ */
 void Curl_data_priority_clear_state(struct Curl_easy *data)
 {
   data->state.weight = 0;
@@ -2505,6 +3066,18 @@ void Curl_data_priority_clear_state(struct Curl_easy *data)
 
 #endif /* USE_HTTP2 || USE_HTTP3 */
 
+/**
+ * @brief Attach protocol metadata to a connection under a key.
+ *
+ * @param[in,out] conn       connection owning the metadata hash.
+ * @param[in]     key        NUL terminated key (copied).
+ * @param[in]     meta_data  the data. Ownership passes to the connection.
+ * @param[in]     meta_dtor  destructor called when removed or on free.
+ * @return CURLE_OK on success
+ * @retval CURLE_OUT_OF_MEMORY insertion failed. @p meta_dtor was already
+ *         called on @p meta_data in that case.
+ * @see Curl_conn_meta_get(), Curl_conn_meta_remove()
+ */
 CURLcode Curl_conn_meta_set(struct connectdata *conn, const char *key,
                             void *meta_data, Curl_meta_dtor *meta_dtor)
 {
@@ -2516,16 +3089,45 @@ CURLcode Curl_conn_meta_set(struct connectdata *conn, const char *key,
   return CURLE_OK;
 }
 
+/**
+ * @brief Remove (and destroy) metadata stored under a key.
+ *
+ * @param[in,out] conn  connection.
+ * @param[in]     key   NUL terminated key. Unknown keys are ignored.
+ * @warning Calls the destructor, so earlier pointers from
+ *          Curl_conn_meta_get() become invalid.
+ */
 void Curl_conn_meta_remove(struct connectdata *conn, const char *key)
 {
   Curl_hash_delete(&conn->meta_hash, key, strlen(key) + 1);
 }
 
+/**
+ * @brief Look up metadata stored on a connection.
+ *
+ * @param[in] conn  connection.
+ * @param[in] key   NUL terminated key.
+ * @return the stored pointer, or NULL if none is set. Owned by the
+ *         connection.
+ */
 void *Curl_conn_meta_get(struct connectdata *conn, const char *key)
 {
   return Curl_hash_pick(&conn->meta_hash, key, strlen(key) + 1);
 }
 
+/**
+ * @brief Get the admin handle responsible for a transfer.
+ *
+ * Returns the transfer itself if it is the admin handle, else the admin
+ * handle of its multi (or of the easy-internal multi). Connection related
+ * settings (idle/age limits, timeouts, no_signal) are copied to it.
+ *
+ * @param[in] data  transfer handle.
+ * @return the admin handle, never NULL.
+ * @warning The returned handle is owned by the multi handle.
+ * @note Having no multi at all is unexpected and asserted in debug builds,
+ *       the transfer itself is then returned.
+ */
 struct Curl_easy *Curl_get_admin(struct Curl_easy *data)
 {
   struct Curl_easy *admin;
@@ -2551,6 +3153,16 @@ struct Curl_easy *Curl_get_admin(struct Curl_easy *data)
   return admin;
 }
 
+/**
+ * @brief Pick the first fatal result of two.
+ *
+ * CURLE_AGAIN is not considered fatal.
+ *
+ * @param[in] r1  first result.
+ * @param[in] r2  second result.
+ * @return @p r1 if it is an error other than CURLE_AGAIN, else @p r2 if it
+ *         is such an error, else @p r1.
+ */
 CURLcode Curl_1st_fatal(CURLcode r1, CURLcode r2)
 {
   if(r1 && (r1 != CURLE_AGAIN))

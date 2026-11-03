@@ -21,6 +21,18 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+
+/**
+ * @file
+ * @brief Entry point of the curl command line tool.
+ *
+ * Defines main() (or wmain() for Unicode Windows builds). It prepares the
+ * process (stderr, standard file descriptors, SIGPIPE, memory tracking),
+ * initialises the global configuration, runs operate() and cleans up.
+ *
+ * @note Not compiled when building the static library for unit tests.
+ * @see tool_operate.c
+ */
 #include "tool_setup.h"
 
 #ifdef _WIN32
@@ -42,26 +54,34 @@
 #include "tool_stderr.h"
 
 #ifdef __VMS
-/*
- * vms_show is a global variable, used in main() as parameter for
- * function vms_special_exit() to allow proper curl tool exiting.
- * Its value may be set in other tool_*.c source files thanks to
- * forward declaration present in tool_vms.h
+/**
+ * @brief Exit status modifier for VMS.
+ *
+ * Global variable used in main() as parameter for vms_special_exit() to
+ * allow proper curl tool exiting. Its value may be set in other tool_*.c
+ * source files thanks to the forward declaration present in tool_vms.h.
  */
 int vms_show = 0;
 #endif
 
 #ifdef __AMIGA__
+/**
+ * @brief Marks min_stack as used so the linker keeps it (Amiga).
+ * @internal
+ */
 #ifdef __GNUC__
 #define CURL_USED __attribute__((used))
 #else
 #define CURL_USED
 #endif
+/* Ask the Amiga loader for a 32 KiB stack. */
 static const char CURL_USED min_stack[] = "$STACK:32768";
 #endif
 
 #ifdef __MINGW32__
-/*
+/**
+ * @brief Disable MinGW command-line globbing.
+ *
  * There seems to be no way to escape "*" in command-line arguments with MinGW
  * when command-line argument globbing is enabled under the MSYS shell, so turn
  * it off.
@@ -73,7 +93,10 @@ int _CRT_glob = 0;
 /* if we build a static library for unit tests, there is no main() function */
 #ifndef UNITTESTS
 
-/*
+/**
+ * @internal
+ * @brief Make sure stdin, stdout and stderr are open.
+ *
  * Ensure that file descriptors 0, 1 and 2 (stdin, stdout, stderr) are
  * open before starting to run. Otherwise, the first three network
  * sockets opened by curl could be used for input sources, downloaded data
@@ -82,6 +105,14 @@ int _CRT_glob = 0;
  * fcntl's F_GETFD instruction returns -1 if the file descriptor is closed,
  * otherwise it returns "the file descriptor flags (which typically can only
  * be FD_CLOEXEC, which is not set here).
+ *
+ * Each closed descriptor is reopened on /dev/null (read-only for stdin,
+ * write-only for stdout and stderr). A no-op without fcntl() and pipe().
+ *
+ * @return 0 if all three descriptors are open, 1 if /dev/null could not
+ *         be opened.
+ * @warning Must run before any socket is created, otherwise sockets may
+ *          occupy descriptors 0-2.
  */
 static int main_checkfds(void)
 {
@@ -108,6 +139,15 @@ static int main_checkfds(void)
 }
 
 #ifdef CURL_MEMDEBUG
+/**
+ * @internal
+ * @brief Start memory debugging if requested by the environment.
+ *
+ * CURL_MEMDEBUG names the log file for allocation tracking and
+ * CURL_MEMLIMIT enables the fail-on-allocation-number-N feature.
+ *
+ * @note Only available in memory-debug builds; otherwise it is a no-op macro.
+ */
 static void memory_tracking_init(void)
 {
   char *env;
@@ -137,8 +177,21 @@ static void memory_tracking_init(void)
 #  define memory_tracking_init() tool_nop_stmt
 #endif
 
-/*
- * curl tool main function.
+/**
+ * @brief The curl tool main function.
+ *
+ * Sets up the process, initialises the global configuration, runs
+ * operate() and frees the configuration again. On Windows Unicode builds
+ * the entry point is wmain() with wide-character arguments.
+ *
+ * @param[in] argc Number of command line arguments.
+ * @param[in] argv Command line arguments.
+ * @return The CURLcode of the run cast to int (0 on success), or
+ *         CURLE_FAILED_INIT if no standard descriptors are available.
+ *         On Windows a failing win32_init() result is returned as is.
+ * @retval 0 All transfers succeeded.
+ * @note On VMS the exit goes through vms_special_exit() instead.
+ * @warning No libcurl function may be called before globalconf_init().
  */
 #ifdef _UNICODE
 #ifdef CURL_HAVE_DIAG

@@ -21,6 +21,24 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file progress.c
+ * @brief Transfer progress accounting, timing and speed limit checks.
+ *
+ * This file keeps the bookkeeping that backs the progress meter, the
+ * application progress callbacks (CURLOPT_XFERINFOFUNCTION and the older
+ * CURLOPT_PROGRESSFUNCTION), the CURLINFO_*_TIME timers and the
+ * CURLOPT_LOW_SPEED_LIMIT / CURLOPT_LOW_SPEED_TIME check.
+ *
+ * All state lives in struct Progress inside struct Curl_easy
+ * (data->progress). Nothing here is synchronized: a handle must only be used
+ * by one thread at a time, as everywhere else in libcurl.
+ *
+ * @defgroup pgrs Progress tracking
+ * @brief Internal progress, timer and speed accounting helpers.
+ * @internal
+ * @{
+ */
 #include "curl_setup.h"
 
 #include "urldata.h"
@@ -31,9 +49,23 @@
 #include "curlx/strcopy.h"
 
 #ifndef CURL_DISABLE_PROGRESS_METER
-/* Provide a string that is 7 letters long (plus the zero byte).
-
-   @unittest 1636 */
+/**
+ * @brief Format a duration as a fixed width string for the progress meter.
+ *
+ * Produces a string that is exactly 7 letters long (plus the zero byte)
+ * and picks the unit by magnitude: "H:MM:SS", "  MM:SS", "HHh MMm",
+ * "DDd HHh", "DDDd", "MMMm" (months) or "YYYYYy". Non-positive input yields
+ * seven spaces and values above 99999 years yield ">99999y".
+ *
+ * @param[out] r       Destination buffer, at least 8 bytes.
+ * @param[in]  rsize   Size of @p r in bytes.
+ * @param[in]  seconds Duration in seconds; values <= 0 mean "unknown".
+ *
+ * @note Output is truncated if @p rsize is too small.
+ * @internal
+ * @see progress_meter()
+ * @unittest 1636
+ */
 UNITTEST void time2str(char *r, size_t rsize, curl_off_t seconds);
 UNITTEST void time2str(char *r, size_t rsize, curl_off_t seconds)
 {
@@ -78,11 +110,25 @@ UNITTEST void time2str(char *r, size_t rsize, curl_off_t seconds)
   }
 }
 
-/* The point of this function would be to return a string of the input data,
-   but never longer than 6 columns (+ one zero byte).
-   Add suffix k, M, G when suitable...
-
-   @unittest 1636 */
+/**
+ * @brief Render a byte count in at most 6 columns (plus the zero byte).
+ *
+ * Values below 100000 are printed as plain numbers. Larger values are
+ * scaled by 1024 and get a suffix k, M, G, T, P or E, printed as "xx.yyU"
+ * or "xxx.yU". A signed 64-bit value is at most 8192 petabytes, shown as
+ * 8.0E (exabytes), so the unit table can never run out.
+ *
+ * @param[in]  bytes  Number of bytes (non-negative).
+ * @param[out] max6   Destination buffer, at least 7 bytes.
+ * @param[in]  mlen   Size of @p max6 in bytes.
+ * @return The @p max6 pointer, to allow use directly as a format argument.
+ *
+ * @warning The returned pointer aliases the caller's buffer; it is only
+ *          valid as long as that buffer is.
+ * @internal
+ * @see progress_meter()
+ * @unittest 1636
+ */
 UNITTEST char *max6out(curl_off_t bytes, char *max6, size_t mlen);
 UNITTEST char *max6out(curl_off_t bytes, char *max6, size_t mlen)
 {
@@ -119,12 +165,38 @@ UNITTEST char *max6out(curl_off_t bytes, char *max6, size_t mlen)
 }
 #endif
 
+/**
+ * @brief Restart the low-speed measurement.
+ *
+ * Clears the moment since which the transfer has been below the low speed
+ * limit, so the next check starts counting from scratch.
+ *
+ * @param[in,out] data  Easy handle whose state.keeps_speed is cleared.
+ * @internal
+ * @see pgrs_speedcheck()
+ */
 static void pgrs_speedinit(struct Curl_easy *data)
 {
   memset(&data->state.keeps_speed, 0, sizeof(struct curltime));
 }
 
-/*
+/**
+ * @brief Enforce CURLOPT_LOW_SPEED_LIMIT / CURLOPT_LOW_SPEED_TIME.
+ *
+ * If the current speed stays below the limit for at least the configured
+ * number of seconds, the transfer is failed. When the check is active, an
+ * EXPIRE_SPEEDCHECK timer is armed so that the speed is looked at again in
+ * one second, even if no socket activity happens.
+ *
+ * Paused transfers (either direction) and handles without both low speed
+ * options set are never checked.
+ *
+ * @param[in,out] data  Easy handle to check.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return CURLE_OK when the transfer is fast enough, not checked or the
+ *         grace time has not run out yet.
+ * @return CURLE_OPERATION_TIMEDOUT when it has been too slow for too long.
+ * @internal
  * @unittest 1606
  */
 UNITTEST CURLcode pgrs_speedcheck(struct Curl_easy *data,
@@ -168,23 +240,40 @@ UNITTEST CURLcode pgrs_speedcheck(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Fetch a fresh current time and cache it in the handle.
+ *
+ * @param[in,out] data  Easy handle whose progress.now is updated.
+ * @return Pointer to data->progress.now.
+ *
+ * @warning The pointer refers to storage inside @p data and is overwritten
+ *          by the next call, so copy the value if it must be kept.
+ */
 const struct curltime *Curl_pgrs_now(struct Curl_easy *data)
 {
   curlx_pnow(&data->progress.now);
   return &data->progress.now;
 }
 
-/* New proposed interface, 9th of February 2000:
-
-   pgrsStartNow() - sets start time
-   pgrsSetDownloadSize(x) - known expected download size
-   pgrsSetUploadSize(x) - known expected upload size
-   pgrsSetDownloadCounter() - amount of data currently downloaded
-   pgrsSetUploadCounter() - amount of data currently uploaded
-   pgrsUpdate() - show progress
-   pgrsDone() - transfer complete
+/**
+ * @brief Finish progress reporting for a completed transfer.
+ *
+ * Forces a final progress update (the meter and callbacks are invoked even
+ * if the last one was recent) and, when the built-in meter is in use,
+ * terminates its output line with a newline.
+ *
+ * Original design notes from the "proposed interface" of 9 Feb 2000:
+ * pgrsStartNow() sets the start time, pgrsSetDownloadSize() and
+ * pgrsSetUploadSize() record the expected sizes, the two counters track the
+ * amount transferred, pgrsUpdate() shows progress and pgrsDone() marks the
+ * transfer complete.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return 0 on success, otherwise the non-zero CURLcode produced by the
+ *         forced update (for instance CURLE_ABORTED_BY_CALLBACK).
+ * @see Curl_pgrsUpdateX()
  */
-
 int Curl_pgrsDone(struct Curl_easy *data, const struct curltime *pnow)
 {
   int rc;
@@ -201,6 +290,16 @@ int Curl_pgrsDone(struct Curl_easy *data, const struct curltime *pnow)
   return 0;
 }
 
+/**
+ * @brief Reset all per-transfer counters, sizes and speed records.
+ *
+ * Zeroes the upload and download counters, marks both sizes as unknown,
+ * drops the speed history and restarts the low-speed measurement. The
+ * timers and start time are not touched, see Curl_pgrsStart().
+ *
+ * @param[in,out] data  Easy handle.
+ * @post Both sizes are unknown and progress.deliver is 0.
+ */
 void Curl_pgrsReset(struct Curl_easy *data)
 {
   Curl_pgrsSetUploadCounter(data, 0);
@@ -212,13 +311,28 @@ void Curl_pgrsReset(struct Curl_easy *data)
   pgrs_speedinit(data);
 }
 
-/* reset the known transfer sizes */
+/**
+ * @brief Mark both the upload and download size as unknown.
+ *
+ * @param[in,out] data  Easy handle.
+ * @see Curl_pgrsSetDownloadSize()
+ * @see Curl_pgrsSetUploadSize()
+ */
 void Curl_pgrsResetTransferSizes(struct Curl_easy *data)
 {
   Curl_pgrsSetDownloadSize(data, -1);
   Curl_pgrsSetUploadSize(data, -1);
 }
 
+/**
+ * @brief Notify progress tracking that receiving is paused or resumed.
+ *
+ * On resume the speed records and the low-speed measurement are reset so
+ * the time spent paused is not counted as being slow.
+ *
+ * @param[in,out] data    Easy handle.
+ * @param[in]     enable  TRUE when pausing, FALSE when unpausing.
+ */
 void Curl_pgrsRecvPause(struct Curl_easy *data, bool enable)
 {
   if(!enable) {
@@ -227,6 +341,14 @@ void Curl_pgrsRecvPause(struct Curl_easy *data, bool enable)
   }
 }
 
+/**
+ * @brief Notify progress tracking that sending is paused or resumed.
+ *
+ * Counterpart of Curl_pgrsRecvPause() for the upload direction.
+ *
+ * @param[in,out] data    Easy handle.
+ * @param[in]     enable  TRUE when pausing, FALSE when unpausing.
+ */
 void Curl_pgrsSendPause(struct Curl_easy *data, bool enable)
 {
   if(!enable) {
@@ -236,6 +358,7 @@ void Curl_pgrsSendPause(struct Curl_easy *data, bool enable)
 }
 
 #ifdef CURLVERBOSE
+/** Human readable timer names, indexed by timerid, for verbose tracing. */
 static const char * const pgrs_timer_names[] = {
   "PGRS-NONE",
   "PGRS-STARTOP",
@@ -250,6 +373,14 @@ static const char * const pgrs_timer_names[] = {
   "PGRS-REDIRECT",
 };
 
+/**
+ * @brief Map a timer id to its trace name.
+ *
+ * @param[in] timer  Timer identifier.
+ * @return The name of the timer, or "?" when @p timer is out of range. The
+ *         string is static and must not be freed.
+ * @internal
+ */
 static const char *pgrs_timer_name(timerid timer)
 {
   if((size_t)timer < CURL_ARRAYSIZE(pgrs_timer_names))
@@ -258,8 +389,21 @@ static const char *pgrs_timer_name(timerid timer)
 }
 #endif /* CURLVERBOSE */
 
-/*
- * Curl_pgrsTimeWas(). Store the timestamp time at the given label.
+/**
+ * @brief Store a timestamp for the given timer label.
+ *
+ * Most timers accumulate the time elapsed since the start of the current
+ * single transfer into data->progress.total (at least 1 microsecond is
+ * always added so that a timer that fired is never reported as zero).
+ * TIMER_STARTOP, TIMER_STARTSINGLE and TIMER_REDIRECT record start offsets
+ * instead, TIMER_POSTQUEUE accumulates queue time over all redirects and
+ * TIMER_STARTTRANSFER is only recorded once per (redirected) transfer.
+ *
+ * @param[in,out] data       Easy handle.
+ * @param[in]     timer      Which timer to store. TIMER_NONE and unknown
+ *                           values are ignored.
+ * @param[in]     timestamp  The time to record, by value.
+ * @see Curl_pgrsTime()
  */
 void Curl_pgrsTimeWas(struct Curl_easy *data, timerid timer,
                       struct curltime timestamp)
@@ -339,17 +483,31 @@ void Curl_pgrsTimeWas(struct Curl_easy *data, timerid timer,
     CURL_TRC_M(data, "[%s] set", pgrs_timer_name(timer));
 }
 
-/*
- * Curl_pgrsTime(). Store the current time at the given label. This fetches a
- * fresh "now" and returns it.
+/**
+ * @brief Store the current time at the given timer label.
  *
- * @unittest: 1399
+ * Fetches a fresh "now" via Curl_pgrs_now() and forwards it to
+ * Curl_pgrsTimeWas().
+ *
+ * @param[in,out] data   Easy handle.
+ * @param[in]     timer  Which timer to store.
+ * @see Curl_pgrsTimeWas()
+ * @unittest 1399
  */
 void Curl_pgrsTime(struct Curl_easy *data, timerid timer)
 {
   Curl_pgrsTimeWas(data, timer, *Curl_pgrs_now(data));
 }
 
+/**
+ * @brief Start progress tracking for a new transfer.
+ *
+ * Records the start time, clears the delta and total timers, zeroes the
+ * counters and flags both sizes as unknown.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     pnow  Start time to use, or NULL to fetch the current time.
+ */
 void Curl_pgrsStart(struct Curl_easy *data, const struct curltime *pnow)
 {
   struct Progress *p = &data->progress;
@@ -368,8 +526,17 @@ void Curl_pgrsStart(struct Curl_easy *data, const struct curltime *pnow)
   p->ul_size_known = FALSE;
 }
 
-/* check that the 'delta' amount of bytes are okay to deliver to the
-   application, or return error if not. */
+/**
+ * @brief Check that delivering more bytes respects CURLOPT_MAXFILESIZE.
+ *
+ * @param[in] data   Easy handle.
+ * @param[in] delta  Number of bytes about to be delivered to the
+ *                   application.
+ * @return CURLE_OK if delivery is allowed or no limit is set.
+ * @return CURLE_FILESIZE_EXCEEDED if the total delivered would exceed the
+ *         configured maximum file size.
+ * @see Curl_pgrs_deliver_inc()
+ */
 CURLcode Curl_pgrs_deliver_check(struct Curl_easy *data, size_t delta)
 {
   if(data->set.max_filesize &&
@@ -380,13 +547,25 @@ CURLcode Curl_pgrs_deliver_check(struct Curl_easy *data, size_t delta)
   return CURLE_OK;
 }
 
-/* this counts how much data is delivered to the application, which
-   in compressed cases may differ from downloaded amount */
+/**
+ * @brief Count bytes delivered to the application.
+ *
+ * In compressed transfers this can differ from the amount downloaded.
+ *
+ * @param[in,out] data   Easy handle.
+ * @param[in]     delta  Number of bytes delivered.
+ */
 void Curl_pgrs_deliver_inc(struct Curl_easy *data, size_t delta)
 {
   data->progress.deliver += delta;
 }
 
+/**
+ * @brief Count downloaded bytes and charge them to the download rate limit.
+ *
+ * @param[in,out] data   Easy handle.
+ * @param[in]     delta  Number of bytes received; 0 is a no-op.
+ */
 void Curl_pgrs_download_inc(struct Curl_easy *data, size_t delta)
 {
   if(delta) {
@@ -395,6 +574,12 @@ void Curl_pgrs_download_inc(struct Curl_easy *data, size_t delta)
   }
 }
 
+/**
+ * @brief Count uploaded bytes and charge them to the upload rate limit.
+ *
+ * @param[in,out] data   Easy handle.
+ * @param[in]     delta  Number of bytes sent; 0 is a no-op.
+ */
 void Curl_pgrs_upload_inc(struct Curl_easy *data, size_t delta)
 {
   if(delta) {
@@ -403,14 +588,25 @@ void Curl_pgrs_upload_inc(struct Curl_easy *data, size_t delta)
   }
 }
 
-/*
- * Set the number of uploaded bytes so far.
+/**
+ * @brief Set the number of uploaded bytes so far.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     size  New upload counter value.
  */
 void Curl_pgrsSetUploadCounter(struct Curl_easy *data, curl_off_t size)
 {
   data->progress.ul.cur_size = size;
 }
 
+/**
+ * @brief Set the expected total download size.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     size  Expected size in bytes, or a negative value to mark
+ *                      the size as unknown (stored as 0 with the known
+ *                      flag cleared).
+ */
 void Curl_pgrsSetDownloadSize(struct Curl_easy *data, curl_off_t size)
 {
   if(size >= 0) {
@@ -423,6 +619,13 @@ void Curl_pgrsSetDownloadSize(struct Curl_easy *data, curl_off_t size)
   }
 }
 
+/**
+ * @brief Set the expected total upload size.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     size  Expected size in bytes, or a negative value to mark
+ *                      the size as unknown.
+ */
 void Curl_pgrsSetUploadSize(struct Curl_easy *data, curl_off_t size)
 {
   if(size >= 0) {
@@ -435,12 +638,30 @@ void Curl_pgrsSetUploadSize(struct Curl_easy *data, curl_off_t size)
   }
 }
 
+/**
+ * @brief Remember how many bytes were sent as TLS early data.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     sent  Number of early data bytes sent.
+ */
 void Curl_pgrsEarlyData(struct Curl_easy *data, curl_off_t sent)
 {
   data->progress.earlydata_sent = sent;
 }
 
-/* returns the average speed in bytes / second */
+/**
+ * @brief Compute an average speed in bytes per second.
+ *
+ * Avoids integer overflow of size * 1000000: when the product would not fit
+ * it divides first, and saturates at CURL_OFF_T_MAX when even that is not
+ * possible.
+ *
+ * @param[in] size  Number of bytes transferred.
+ * @param[in] us    Elapsed time in microseconds; values < 1 are treated as
+ *                  "instant" and yield size * 1000000.
+ * @return Average speed in bytes per second.
+ * @internal
+ */
 static curl_off_t trspeed(curl_off_t size, /* number of bytes */
                           curl_off_t us)   /* microseconds */
 {
@@ -454,7 +675,22 @@ static curl_off_t trspeed(curl_off_t size, /* number of bytes */
     return CURL_OFF_T_MAX;
 }
 
-/* returns TRUE if it is time to show the progress meter */
+/**
+ * @brief Update speeds and the history of speed records.
+ *
+ * Computes the overall average speeds and the "current" speed, which is
+ * measured over a sliding window of up to CURL_SPEED_RECORDS one-second
+ * records. A new record is only created when at least a second has passed,
+ * so frequent calls do not ruin the history. When the transfer is done and
+ * no current speed exists yet, the last record is updated instead.
+ *
+ * @param[in,out] data  Easy handle whose progress fields are updated.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return TRUE if it is time to show the progress meter (at most once a
+ *         second, always for the first call and when the transfer is done),
+ *         FALSE otherwise.
+ * @internal
+ */
 static bool progress_calc(struct Curl_easy *data,
                           const struct curltime *pnow)
 {
@@ -535,11 +771,22 @@ static bool progress_calc(struct Curl_easy *data,
 
 #ifndef CURL_DISABLE_PROGRESS_METER
 
+/** Time and completion estimate for one transfer direction. */
 struct pgrs_estimate {
+  /** Estimated total duration in seconds, 0 if unknown. */
   curl_off_t secs;
+  /** Estimated completion in percent, 0 if unknown. */
   curl_off_t percent;
 };
 
+/**
+ * @brief Compute a percentage without overflowing curl_off_t.
+ *
+ * @param[in] total  Total size; 0 or negative gives 0.
+ * @param[in] cur    Amount transferred so far.
+ * @return @p cur as a percentage of @p total (not clamped to 100).
+ * @internal
+ */
 static curl_off_t pgrs_est_percent(curl_off_t total, curl_off_t cur)
 {
   if(total > 10000)
@@ -549,6 +796,18 @@ static curl_off_t pgrs_est_percent(curl_off_t total, curl_off_t cur)
   return 0;
 }
 
+/**
+ * @brief Estimate duration and completion for one direction.
+ *
+ * The estimate is based on the average speed so far and is only produced
+ * when the total size is known and the speed is positive; otherwise both
+ * fields are set to 0.
+ *
+ * @param[in]  d            Per-direction progress data.
+ * @param[in]  total_known  Whether d->total_size is valid.
+ * @param[out] est          Receives the estimate.
+ * @internal
+ */
 static void pgrs_estimates(struct pgrs_dir *d,
                            bool total_known,
                            struct pgrs_estimate *est)
@@ -561,6 +820,20 @@ static void pgrs_estimates(struct pgrs_dir *d,
   }
 }
 
+/**
+ * @brief Print the classic curl progress meter line to data->set.err.
+ *
+ * On the first call the two-line column header is printed (preceded by a
+ * resume notice when applicable). Each call then rewrites the status line
+ * with percentages, sizes, average and current speeds, and total, spent
+ * and remaining time, then flushes the stream. Combined totals are capped
+ * at CURL_OFF_T_MAX on overflow.
+ *
+ * @param[in,out] data  Easy handle; progress.headers_out is set.
+ * @note Compiled out (macro expands to a no-op statement) when
+ *       CURL_DISABLE_PROGRESS_METER is defined.
+ * @internal
+ */
 static void progress_meter(struct Curl_easy *data)
 {
   struct Progress *p = &data->progress;
@@ -648,12 +921,25 @@ static void progress_meter(struct Curl_easy *data)
   fflush(data->set.err);
 }
 #else /* CURL_DISABLE_PROGRESS_METER */
+/** No-op replacement when the progress meter is disabled at build time. */
 #define progress_meter(x) Curl_nop_stmt
 #endif
 
-/*
- * Curl_pgrsUpdate() returns 0 for success or the value returned by the
- * progress callback!
+/**
+ * @brief Invoke the progress callback and optionally the progress meter.
+ *
+ * Nothing is done if progress is hidden. The extended callback
+ * (xferinfo) takes precedence over the deprecated one. A non-zero return
+ * from the callback other than CURL_PROGRESSFUNC_CONTINUE aborts the
+ * transfer; a zero return from a non-CONTINUE value (such as a callback
+ * that handles drawing itself) suppresses the built-in meter this round.
+ *
+ * @param[in,out] data          Easy handle.
+ * @param[in]     showprogress  TRUE if the built-in meter should be drawn.
+ * @return CURLE_OK on success.
+ * @return CURLE_ABORTED_BY_CALLBACK if the application callback returned a
+ *         non-zero value.
+ * @internal
  */
 static CURLcode pgrsupdate(struct Curl_easy *data, bool showprogress)
 {
@@ -703,6 +989,14 @@ static CURLcode pgrsupdate(struct Curl_easy *data, bool showprogress)
   return CURLE_OK;
 }
 
+/**
+ * @brief Recalculate progress and report it.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return CURLE_OK or CURLE_ABORTED_BY_CALLBACK, see pgrsupdate().
+ * @internal
+ */
 static CURLcode pgrs_update(struct Curl_easy *data,
                             const struct curltime *pnow)
 {
@@ -710,17 +1004,42 @@ static CURLcode pgrs_update(struct Curl_easy *data,
   return pgrsupdate(data, showprogress);
 }
 
+/**
+ * @brief Update progress using a freshly fetched current time.
+ *
+ * @param[in,out] data  Easy handle.
+ * @return CURLE_OK, or CURLE_ABORTED_BY_CALLBACK if the progress callback
+ *         asked to stop.
+ */
 CURLcode Curl_pgrsUpdate(struct Curl_easy *data)
 {
   return pgrs_update(data, Curl_pgrs_now(data));
 }
 
+/**
+ * @brief Update progress using a caller supplied time.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return CURLE_OK, or CURLE_ABORTED_BY_CALLBACK if the progress callback
+ *         asked to stop.
+ */
 CURLcode Curl_pgrsUpdateX(struct Curl_easy *data,
                           const struct curltime *pnow)
 {
   return pgrs_update(data, pnow);
 }
 
+/**
+ * @brief Update progress and run the low-speed check.
+ *
+ * The speed check is skipped once the request is done.
+ *
+ * @param[in,out] data  Easy handle.
+ * @param[in]     pnow  Current time, not NULL.
+ * @return CURLE_OK, CURLE_ABORTED_BY_CALLBACK from the update, or
+ *         CURLE_OPERATION_TIMEDOUT from the speed check.
+ */
 CURLcode Curl_pgrsCheckX(struct Curl_easy *data,
                          const struct curltime *pnow)
 {
@@ -732,25 +1051,48 @@ CURLcode Curl_pgrsCheckX(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Like Curl_pgrsCheckX() with a freshly fetched current time.
+ *
+ * @param[in,out] data  Easy handle.
+ * @return Same values as Curl_pgrsCheckX().
+ */
 CURLcode Curl_pgrsCheck(struct Curl_easy *data)
 {
   return Curl_pgrsCheckX(data, Curl_pgrs_now(data));
 }
 
-/*
- * Update all progress, do not do progress meter/callbacks.
+/**
+ * @brief Update all progress values without meter or callbacks.
+ *
+ * @param[in,out] data  Easy handle.
  */
 void Curl_pgrsUpdate_nometer(struct Curl_easy *data)
 {
   (void)progress_calc(data, Curl_pgrs_now(data));
 }
 
+/**
+ * @brief Finalize the total time spent for a finished transfer.
+ *
+ * @param[in,out] data  Easy handle; progress.total.spent_us is set.
+ */
 void Curl_pgrsCompleted(struct Curl_easy *data)
 {
   struct Progress * const p = &data->progress;
   p->total.spent_us = curlx_ptimediff_us(Curl_pgrs_now(data), &p->start);
 }
 
+/**
+ * @brief Milliseconds elapsed since a start timer.
+ *
+ * @param[in,out] data   Easy handle.
+ * @param[in]     pnow   Current time, or NULL to fetch it.
+ * @param[in]     timer  Either TIMER_STARTOP or TIMER_STARTSINGLE; any
+ *                       other value is a programming error (asserts in
+ *                       debug builds).
+ * @return Elapsed milliseconds, or 0 for an unsupported @p timer.
+ */
 timediff_t Curl_pgrs_since_ms(struct Curl_easy *data,
                               const struct curltime *pnow,
                               timerid timer)
@@ -769,3 +1111,4 @@ timediff_t Curl_pgrs_since_ms(struct Curl_easy *data,
     return 0;
   }
 }
+/** @} */
