@@ -21,6 +21,26 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file transfer.c
+ * @brief Generic transfer engine: receive/send loop and request setup.
+ *
+ * Contains the protocol independent parts of performing a transfer: the
+ * non-blocking receive and send handlers driven by the multi interface
+ * (Curl_sendrecv()), the preparation done right before a transfer starts
+ * (Curl_pretransfer()), connection retry logic, and the small Curl_xfer_*
+ * helpers that protocol handlers use to set up directions, write response
+ * data to the client, send and receive on the connection and pause or
+ * unpause either direction.
+ *
+ * All functions operate on a struct Curl_easy and are not thread-safe for
+ * the same handle; a handle must be driven by a single thread at a time.
+ *
+ * @defgroup xfer Transfer engine
+ * @brief Internal helpers that drive a single transfer.
+ * @internal
+ * @{
+ */
 #include "curl_setup.h"
 
 #ifdef HAVE_NETINET_IN_H
@@ -75,11 +95,22 @@
 
 #if !defined(CURL_DISABLE_HTTP) || !defined(CURL_DISABLE_SMTP) || \
   !defined(CURL_DISABLE_IMAP)
-/*
- * checkheaders() checks the linked list of custom headers for a
- * particular header (prefix). Provide the prefix without colon!
+/**
+ * @brief Find a custom header in the user supplied header list.
  *
- * Returns a pointer to the first matching header or NULL if none matched.
+ * Checks the linked list of custom headers (CURLOPT_HTTPHEADER) for a
+ * particular header name prefix. The comparison is case-insensitive and
+ * the character following the prefix must be a header separator.
+ *
+ * @param[in] data        Easy handle holding the custom header list.
+ * @param[in] thisheader  Header name prefix, WITHOUT the trailing colon.
+ * @param[in] thislen     Length of @p thisheader, must be non-zero.
+ * @return Pointer to the data of the first matching header, or NULL if none
+ *         matched.
+ *
+ * @note The returned string is owned by the slist in @p data and must not
+ *       be freed or modified.
+ * @warning The pointer is only valid until the header list is changed.
  */
 char *Curl_checkheaders(const struct Curl_easy *data,
                         const char *thisheader,
@@ -99,6 +130,19 @@ char *Curl_checkheaders(const struct Curl_easy *data,
 }
 #endif
 
+/**
+ * @brief Tell if more data may be readable without waiting for the socket.
+ *
+ * For FTP the secondary (data) connection is queried. For SCP and SFTP
+ * (libssh2) we can never be sure its internal buffers are drained, so we
+ * must always try until EAGAIN comes back.
+ *
+ * @param[in] data         Easy handle with an attached connection.
+ * @param[in] rcvd_eagain  TRUE if the last receive returned CURLE_AGAIN.
+ * @return Non-zero if there may be pending data, 0 otherwise.
+ * @pre data->conn is set.
+ * @internal
+ */
 static int data_pending(struct Curl_easy *data, bool rcvd_eagain)
 {
   struct connectdata *conn = data->conn;
@@ -113,9 +157,19 @@ static int data_pending(struct Curl_easy *data, bool rcvd_eagain)
          Curl_conn_data_pending(data, FIRSTSOCKET);
 }
 
-/*
- * Check to see if CURLOPT_TIMECONDITION was met by comparing the time of the
- * remote document with the time provided by CURLOPT_TIMEVAL
+/**
+ * @brief Check CURLOPT_TIMECONDITION against the remote document time.
+ *
+ * Compares the modification time of the remote document with the time
+ * given by CURLOPT_TIMEVALUE, honoring if-modified-since and
+ * if-unmodified-since semantics. If a condition is not met, the info
+ * flag data->info.timecond is set.
+ *
+ * @param[in,out] data       Easy handle.
+ * @param[in]     timeofdoc  Remote document time, 0 if unknown.
+ * @return TRUE if the transfer should proceed (condition met, no condition
+ *         set or document time unknown).
+ * @return FALSE if the condition was not met.
  */
 bool Curl_meets_timecondition(struct Curl_easy *data, time_t timeofdoc)
 {
@@ -143,6 +197,16 @@ bool Curl_meets_timecondition(struct Curl_easy *data, time_t timeofdoc)
   return TRUE;
 }
 
+/**
+ * @brief Try once to shut down the receiving side of the connection.
+ *
+ * @param[in,out] data  Easy handle, may be NULL.
+ * @param[out]    done  Set to TRUE when the shutdown has completed.
+ * @return CURLE_OK on progress or completion, CURLE_FAILED_INIT if there
+ *         is no handle or connection, or the error from the connection
+ *         shutdown attempt.
+ * @internal
+ */
 static CURLcode xfer_recv_shutdown(struct Curl_easy *data, bool *done)
 {
   if(!data || !data->conn)
@@ -150,6 +214,15 @@ static CURLcode xfer_recv_shutdown(struct Curl_easy *data, bool *done)
   return Curl_cshutdn_try_once_idx(data, data->conn->recv_idx, done);
 }
 
+/**
+ * @brief Tell if the receive side of the connection is already shutting
+ *        down.
+ *
+ * @param[in] data  Easy handle, may be NULL.
+ * @return TRUE if the shutdown of the receive filter chain has started,
+ *         FALSE otherwise (also without a connection).
+ * @internal
+ */
 static bool xfer_recv_shutdown_started(struct Curl_easy *data)
 {
   if(!data || !data->conn)
@@ -157,6 +230,15 @@ static bool xfer_recv_shutdown_started(struct Curl_easy *data)
   return CURL_CONN_IN_SHUTDOWN(data->conn, data->conn->recv_idx);
 }
 
+/**
+ * @brief Try once to shut down the sending side of the connection.
+ *
+ * @param[in,out] data  Easy handle, may be NULL.
+ * @param[out]    done  Set to TRUE when the shutdown has completed.
+ * @return CURLE_OK on progress or completion, CURLE_FAILED_INIT if there
+ *         is no handle or connection, or the error from the shutdown.
+ * @see Curl_xfer_set_shutdown()
+ */
 CURLcode Curl_xfer_send_shutdown(struct Curl_easy *data, bool *done)
 {
   if(!data || !data->conn)
@@ -165,12 +247,24 @@ CURLcode Curl_xfer_send_shutdown(struct Curl_easy *data, bool *done)
 }
 
 /**
- * Receive raw response data for the transfer.
- * @param data         the transfer
- * @param buf          buffer to keep response data received
- * @param blen         length of `buf`
- * @param eos_reliable if EOS detection in underlying connection is reliable
- * @return number of bytes read or -1 for error
+ * @brief Receive raw response data for the transfer.
+ *
+ * When reading BODY data on a connection that cannot reliably signal EOS
+ * and the body size is known, the read size is limited to what is still
+ * expected. Once a receive shutdown has started, nothing more is read.
+ * A zero length read on a transfer marked for shutdown continues the
+ * shutdown and reports CURLE_AGAIN until it completes.
+ *
+ * @param[in,out] data          The transfer.
+ * @param[out]    buf           Buffer to keep the response data received.
+ * @param[in]     blen          Length of @p buf, must be non-zero.
+ * @param[in]     eos_reliable  TRUE if EOS detection in the underlying
+ *                              connection is reliable.
+ * @param[out]    pnread        Number of bytes placed in @p buf, 0 at EOS.
+ * @return CURLE_OK on success (including EOS with *pnread == 0).
+ * @return CURLE_AGAIN if no data is available or the shutdown is pending.
+ * @return Any other CURLcode on a receive or shutdown error.
+ * @internal
  */
 static CURLcode xfer_recv_resp(struct Curl_easy *data,
                                char *buf, size_t blen,
@@ -212,10 +306,24 @@ static CURLcode xfer_recv_resp(struct Curl_easy *data,
   return CURLE_OK;
 }
 
-/*
- * Go ahead and do a read if we have a readable socket or if
- * the stream was rewound (in which case we have data in a
- * buffer)
+/**
+ * @brief Read response data when the connection is readable.
+ *
+ * Loops up to a bounded number of times, reading into the shared transfer
+ * buffer and handing the data to Curl_xfer_write_resp(). Honors download
+ * rate limits, stops when the response is complete and, when it did not
+ * drain the connection, marks the transfer dirty so it is run again
+ * without waiting for a socket event. Also aborts a still running upload
+ * when the connection must close after the download is finished.
+ *
+ * @param[in,out] data  The transfer.
+ * @param[in,out] k     The request state of @p data (data->req).
+ * @return CURLE_OK when no error occurred (more data may remain).
+ * @return Any CURLcode from receiving, writing to the client or stopping
+ *         the request; CURLE_AGAIN from the receive is not an error.
+ * @note The transfer buffer is borrowed from the multi handle and is always
+ *       released again before returning.
+ * @internal
  */
 static CURLcode sendrecv_dl(struct Curl_easy *data,
                             struct SingleRequest *k)
@@ -334,8 +442,14 @@ out:
   return result;
 }
 
-/*
- * Send data to upload to the server, when the socket is writable.
+/**
+ * @brief Send upload data when the socket is writable.
+ *
+ * @param[in,out] data  The transfer.
+ * @return CURLE_OK if there is nothing (more) to send or the send worked,
+ *         otherwise the CURLcode from Curl_req_send_more().
+ * @pre Sending is not yet done for the request.
+ * @internal
  */
 static CURLcode sendrecv_ul(struct Curl_easy *data)
 {
@@ -347,9 +461,23 @@ static CURLcode sendrecv_ul(struct Curl_easy *data)
   return CURLE_OK;
 }
 
-/*
- * Curl_sendrecv() is the low-level function to be called when data is to
- * be read and written to/from the connection.
+/**
+ * @brief Low-level function to read and write data to/from the connection.
+ *
+ * Called by the multi state machine while a transfer is in the performing
+ * state. It receives and/or sends data as wanted by the request, then
+ * checks the overall timeout, whether a known-size response was
+ * truncated, marks the request done when no I/O is wanted anymore, and
+ * finally updates progress and runs the low speed check.
+ *
+ * @param[in,out] data  The transfer.
+ * @return CURLE_OK on success, also if the transfer is blocked (paused).
+ * @return CURLE_OPERATION_TIMEDOUT when the transfer timeout is exceeded.
+ * @return CURLE_PARTIAL_FILE when the connection closed before all the
+ *         announced bytes arrived (and no redirect is pending).
+ * @return Other CURLcode values from reading, writing or the progress
+ *         callback (for instance CURLE_ABORTED_BY_CALLBACK).
+ * @post data->req.done is TRUE if no more I/O is wanted.
  */
 CURLcode Curl_sendrecv(struct Curl_easy *data)
 {
@@ -423,8 +551,14 @@ out:
   return result;
 }
 
-/* Curl_init_CONNECT() gets called each time the handle switches to CONNECT
-   which means this gets called once for each subsequent redirect etc */
+/**
+ * @brief Reset read-callback and upload state when entering CONNECT.
+ *
+ * Gets called each time the handle switches to CONNECT, which means once
+ * for each subsequent redirect and so on.
+ *
+ * @param[in,out] data  The transfer.
+ */
 void Curl_init_CONNECT(struct Curl_easy *data)
 {
   data->state.fread_func = data->set.fread_func_set;
@@ -432,10 +566,28 @@ void Curl_init_CONNECT(struct Curl_easy *data)
   data->state.upload = (data->state.httpreq == HTTPREQ_PUT);
 }
 
-/*
- * Curl_pretransfer() is called immediately before a transfer starts, and only
- * once for one transfer no matter if it has redirects or do multi-pass
- * authentication etc.
+/**
+ * @brief Prepare a handle immediately before a transfer starts.
+ *
+ * Called once per transfer, no matter if it has redirects or does
+ * multi-pass authentication. It resets per-transfer state, validates that a
+ * URL is set (taking CURLOPT_CURLU into account), computes the upload size,
+ * loads cookie, resolve and HSTS data, ignores SIGPIPE where needed,
+ * resets progress, prepares FTP wildcard matching and clears client
+ * readers/writers and collected headers.
+ *
+ * @param[in,out] data  The transfer.
+ * @return CURLE_OK on success.
+ * @return CURLE_URL_MALFORMAT if no URL is set or the CURLU handle cannot
+ *         produce one.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if POSTFIELDS is mixed with
+ *         RESUME_FROM.
+ * @return CURLE_OUT_OF_MEMORY on allocation failure.
+ * @return Other CURLcode values from loading cookies, hosts pairs or HSTS.
+ *
+ * @warning With CURLOPT_CURLU the URL is copied from the CURLU handle at
+ *          this point; later changes to that handle are not seen until
+ *          the next transfer.
  */
 CURLcode Curl_pretransfer(struct Curl_easy *data)
 {
@@ -600,9 +752,26 @@ CURLcode Curl_pretransfer(struct Curl_easy *data)
   return result;
 }
 
-/* Returns CURLE_OK *and* sets '*url' if a request retry is wanted.
-
-   NOTE: that the *url is curlx_malloc()ed. */
+/**
+ * @brief Decide if the request must be retried on a fresh connection.
+ *
+ * This happens when a reused connection turns out to be dead (no data was
+ * exchanged) or when the server refused the stream. On retry the
+ * connection is closed and the request rewound. At most CONN_MAX_RETRIES
+ * attempts are made.
+ *
+ * @param[in,out] data  The transfer.
+ * @param[out]    url   Set to a newly allocated copy of the URL when a
+ *                      retry is wanted, otherwise NULL.
+ * @return CURLE_OK, also if no retry is wanted; check @p url to tell.
+ * @return CURLE_SEND_ERROR if the retry limit was exceeded.
+ * @return CURLE_OUT_OF_MEMORY if the URL could not be duplicated.
+ *
+ * @note The returned URL is allocated with curlx_malloc() and the caller
+ *       owns it and must release it.
+ * @warning Uploads over non-HTTP/RTSP protocols are never retried since the
+ *          request body cannot be assumed to be replayable.
+ */
 CURLcode Curl_retry_request(struct Curl_easy *data, char **url)
 {
   struct connectdata *conn = data->conn;
@@ -644,6 +813,7 @@ CURLcode Curl_retry_request(struct Curl_easy *data, char **url)
     retry = TRUE;
   }
   if(retry) {
+/** Maximum number of fresh-connection retries for one request. */
 #define CONN_MAX_RETRIES 5
     if(data->state.retrycount++ >= CONN_MAX_RETRIES) {
       failf(data, "Connection died, tried %d times before giving up",
@@ -667,6 +837,22 @@ CURLcode Curl_retry_request(struct Curl_easy *data, char **url)
   return CURLE_OK;
 }
 
+/**
+ * @brief Configure the transfer directions and expected receive size.
+ *
+ * Stores the socket indexes to send and receive on in the connection,
+ * initializes the request, sets the download size for progress when the
+ * protocol does not parse headers, and enables the send/receive wanted
+ * flags on the request.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     send_idx   Socket index to send on, or -1 for none.
+ * @param[in]     recv_idx   Socket index to receive on, or -1 for none.
+ * @param[in]     recv_size  How much to receive, -1 if unknown. Must be -1
+ *                           when not receiving.
+ * @pre data->conn is set and the indexes are in the range -1 to 1.
+ * @internal
+ */
 static void xfer_setup(
   struct Curl_easy *data,   /* transfer */
   int8_t send_idx,             /* sockindex to send on or -1 */
@@ -712,11 +898,23 @@ static void xfer_setup(
              conn->recv_idx, conn->send_idx);
 }
 
+/**
+ * @brief Set up a transfer that neither sends nor receives.
+ *
+ * @param[in,out] data  The transfer.
+ */
 void Curl_xfer_setup_nop(struct Curl_easy *data)
 {
   xfer_setup(data, -1, -1, -1);
 }
 
+/**
+ * @brief Set up a transfer that sends and receives on one socket.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     sockindex  Socket index used for both directions.
+ * @param[in]     recv_size  Expected amount to receive, -1 if unknown.
+ */
 void Curl_xfer_setup_sendrecv(struct Curl_easy *data,
                               int8_t sockindex,
                               curl_off_t recv_size)
@@ -724,12 +922,25 @@ void Curl_xfer_setup_sendrecv(struct Curl_easy *data,
   xfer_setup(data, sockindex, sockindex, recv_size);
 }
 
+/**
+ * @brief Set up a transfer that only sends.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     sockindex  Socket index to send on.
+ */
 void Curl_xfer_setup_send(struct Curl_easy *data,
                           int8_t sockindex)
 {
   xfer_setup(data, sockindex, -1, -1);
 }
 
+/**
+ * @brief Set up a transfer that only receives.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     sockindex  Socket index to receive on.
+ * @param[in]     recv_size  Expected amount to receive, -1 if unknown.
+ */
 void Curl_xfer_setup_recv(struct Curl_easy *data,
                           int8_t sockindex,
                           curl_off_t recv_size)
@@ -737,6 +948,14 @@ void Curl_xfer_setup_recv(struct Curl_easy *data,
   xfer_setup(data, -1, sockindex, recv_size);
 }
 
+/**
+ * @brief Request a connection shutdown at the end of the transfer.
+ *
+ * @param[in,out] data           The transfer.
+ * @param[in]     shutdown       TRUE to shut down the connection when done.
+ * @param[in]     ignore_errors  TRUE to ignore errors during that shutdown.
+ * @pre The transfer either only sends or only receives.
+ */
 void Curl_xfer_set_shutdown(struct Curl_easy *data,
                             bool shutdown,
                             bool ignore_errors)
@@ -748,6 +967,23 @@ void Curl_xfer_set_shutdown(struct Curl_easy *data,
   data->req.shutdown_err_ignore = ignore_errors;
 }
 
+/**
+ * @brief Write received response data to the client.
+ *
+ * If the protocol handler provides a write_resp function, it takes full
+ * responsibility for the data. Otherwise everything is written as BODY
+ * through the client writer chain. Writing the end-of-stream marker
+ * successfully marks the download as done.
+ *
+ * @param[in,out] data    The transfer.
+ * @param[in]     buf     Received data, not necessarily null-terminated.
+ * @param[in]     blen    Number of bytes in @p buf.
+ * @param[in]     is_eos  TRUE if this is the last data of the response.
+ * @return CURLE_OK on success, otherwise the CURLcode from the handler or
+ *         client write callbacks (for example CURLE_WRITE_ERROR).
+ * @post On success with @p is_eos, req.eos_written and req.download_done
+ *       are TRUE.
+ */
 CURLcode Curl_xfer_write_resp(struct Curl_easy *data,
                               const char *buf, size_t blen,
                               bool is_eos)
@@ -780,11 +1016,30 @@ CURLcode Curl_xfer_write_resp(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Tell if writing to the client is currently paused.
+ *
+ * @param[in] data  The transfer.
+ * @return TRUE if the client writer is paused, FALSE otherwise.
+ */
 bool Curl_xfer_write_is_paused(struct Curl_easy *data)
 {
   return Curl_cwriter_is_paused(data);
 }
 
+/**
+ * @brief Write received response header data to the client.
+ *
+ * Protocol handlers with their own write_resp_hd function take full
+ * responsibility; otherwise the bytes are written as normal response data.
+ *
+ * @param[in,out] data    The transfer.
+ * @param[in]     hd0     Header bytes, must be null-terminated at
+ *                        @p hdlen when a handler function is used.
+ * @param[in]     hdlen   Number of header bytes.
+ * @param[in]     is_eos  TRUE if this is the last data of the response.
+ * @return CURLE_OK on success, otherwise the CURLcode from the writer.
+ */
 CURLcode Curl_xfer_write_resp_hd(struct Curl_easy *data,
                                  const char *hd0, size_t hdlen, bool is_eos)
 {
@@ -798,22 +1053,58 @@ CURLcode Curl_xfer_write_resp_hd(struct Curl_easy *data,
   return Curl_xfer_write_resp(data, hd0, hdlen, is_eos);
 }
 
+/**
+ * @brief Signal the end of response writing to the client writers.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     premature  Unused, whether the transfer ended early.
+ * @return CURLE_OK, or the error from flushing the output writer.
+ */
 CURLcode Curl_xfer_write_done(struct Curl_easy *data, bool premature)
 {
   (void)premature;
   return Curl_cw_out_done(data);
 }
 
+/**
+ * @brief Tell if buffered send data still needs flushing.
+ *
+ * @param[in] data  The transfer.
+ * @return TRUE if the send side of the connection has unflushed data.
+ */
 bool Curl_xfer_needs_flush(struct Curl_easy *data)
 {
   return Curl_conn_needs_flush(data, data->conn->send_idx);
 }
 
+/**
+ * @brief Flush buffered send data on the connection.
+ *
+ * @param[in,out] data  The transfer.
+ * @return CURLE_OK, CURLE_AGAIN if not everything could be flushed yet,
+ *         or another CURLcode on a send failure.
+ */
 CURLcode Curl_xfer_flush(struct Curl_easy *data)
 {
   return Curl_conn_flush(data, data->conn->send_idx);
 }
 
+/**
+ * @brief Send data on the transfer's send socket.
+ *
+ * CURLE_AGAIN from the connection is turned into success with zero bytes
+ * written. Bytes sent are added to the request size info.
+ *
+ * @param[in,out] data       The transfer.
+ * @param[in]     buf        Data to send.
+ * @param[in]     blen       Number of bytes in @p buf.
+ * @param[in]     eos        TRUE if this is the last data to send.
+ * @param[out]    pnwritten  Number of bytes accepted; may be less than
+ *                           @p blen or 0.
+ * @return CURLE_OK on success (check @p pnwritten) or CURLE_AGAIN
+ *         translated, otherwise the send error such as CURLE_SEND_ERROR.
+ * @pre data->conn is set.
+ */
 CURLcode Curl_xfer_send(struct Curl_easy *data,
                         const void *buf, size_t blen, bool eos,
                         size_t *pnwritten)
@@ -837,6 +1128,19 @@ CURLcode Curl_xfer_send(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Receive data on the transfer's receive socket.
+ *
+ * The read size is capped to the configured CURLOPT_BUFFERSIZE.
+ *
+ * @param[in,out] data    The transfer.
+ * @param[out]    buf     Buffer for the received data.
+ * @param[in]     blen    Capacity of @p buf in bytes.
+ * @param[out]    pnrcvd  Number of bytes received.
+ * @return CURLE_OK on success, CURLE_AGAIN if nothing is available now,
+ *         or another CURLcode such as CURLE_RECV_ERROR.
+ * @pre data->conn is set.
+ */
 CURLcode Curl_xfer_recv(struct Curl_easy *data,
                         char *buf, size_t blen,
                         size_t *pnrcvd)
@@ -850,12 +1154,26 @@ CURLcode Curl_xfer_recv(struct Curl_easy *data,
   return Curl_conn_recv(data, data->conn->recv_idx, buf, blen, pnrcvd);
 }
 
+/**
+ * @brief Tell the connection filters that sending is finished.
+ *
+ * @param[in,out] data  The transfer.
+ * @return Always CURLE_OK.
+ */
 CURLcode Curl_xfer_send_close(struct Curl_easy *data)
 {
   Curl_conn_ev_data_done_send(data);
   return CURLE_OK;
 }
 
+/**
+ * @brief Tell if the transfer cannot make progress because of pauses.
+ *
+ * The transfer is blocked if every direction it wants is paused.
+ *
+ * @param[in] data  The transfer.
+ * @return TRUE if all wanted directions are paused, FALSE otherwise.
+ */
 bool Curl_xfer_is_blocked(struct Curl_easy *data)
 {
   bool want_send = CURL_REQ_WANT_SEND(data);
@@ -868,16 +1186,38 @@ bool Curl_xfer_is_blocked(struct Curl_easy *data)
     return Curl_xfer_recv_is_paused(data) && Curl_xfer_send_is_paused(data);
 }
 
+/**
+ * @brief Tell if sending is paused or blocked by the upload rate limit.
+ *
+ * @param[in] data  The transfer.
+ * @return TRUE if the upload rate limiter is blocking, FALSE otherwise.
+ */
 bool Curl_xfer_send_is_paused(struct Curl_easy *data)
 {
   return Curl_rlimit_is_blocked(&data->progress.ul.rlimit);
 }
 
+/**
+ * @brief Tell if receiving is paused or blocked by the download rate limit.
+ *
+ * @param[in] data  The transfer.
+ * @return TRUE if the download rate limiter is blocking, FALSE otherwise.
+ */
 bool Curl_xfer_recv_is_paused(struct Curl_easy *data)
 {
   return Curl_rlimit_is_blocked(&data->progress.dl.rlimit);
 }
 
+/**
+ * @brief Pause or unpause sending for the transfer.
+ *
+ * Unpausing also resumes a paused client reader and resets the speed
+ * records.
+ *
+ * @param[in,out] data    The transfer.
+ * @param[in]     enable  TRUE to pause, FALSE to unpause.
+ * @return CURLE_OK, or the error from unpausing the client reader.
+ */
 CURLcode Curl_xfer_pause_send(struct Curl_easy *data, bool enable)
 {
   CURLcode result = CURLE_OK;
@@ -888,6 +1228,17 @@ CURLcode Curl_xfer_pause_send(struct Curl_easy *data, bool enable)
   return result;
 }
 
+/**
+ * @brief Pause or unpause receiving for the transfer.
+ *
+ * Unpausing also resumes a paused client writer, notifies the connection
+ * filters and resets the speed records.
+ *
+ * @param[in,out] data    The transfer.
+ * @param[in]     enable  TRUE to pause, FALSE to unpause.
+ * @return CURLE_OK, or the error from unpausing the client writer (for
+ *         instance buffered data that fails to be delivered).
+ */
 CURLcode Curl_xfer_pause_recv(struct Curl_easy *data, bool enable)
 {
   CURLcode result = CURLE_OK;
@@ -899,6 +1250,16 @@ CURLcode Curl_xfer_pause_recv(struct Curl_easy *data, bool enable)
   return result;
 }
 
+/**
+ * @brief Tell if the transfer's origin is reached over a secure scheme.
+ *
+ * Forward proxy connections count as not secure, since https: and other
+ * SSL based URLs never use a forward proxy for the origin.
+ *
+ * @param[in] data  The transfer.
+ * @return Non-zero (the PROTOPT_SSL flag) if the origin scheme uses SSL,
+ *         FALSE (0) otherwise.
+ */
 bool Curl_xfer_is_secure(struct Curl_easy *data)
 {
 #ifndef CURL_DISABLE_PROXY
@@ -912,3 +1273,4 @@ bool Curl_xfer_is_secure(struct Curl_easy *data)
 #endif
   return (data->state.origin->scheme->flags & PROTOPT_SSL);
 }
+/** @} */

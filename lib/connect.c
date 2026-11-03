@@ -21,6 +21,18 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file
+ * @brief Connection setup, connect timeouts and connection state helpers.
+ *
+ * Contains the functions that drive a connection's filter chain to the
+ * connected state (Curl_conn_setup(), Curl_conn_connect()), that compute
+ * how much time is left for connecting or for the whole transfer, and
+ * small accessors for the peers and flags of a struct connectdata.
+ *
+ * @see cfilters.h, connect.h
+ */
+
 #include "curl_setup.h"
 
 #include "urldata.h"
@@ -40,6 +52,17 @@
 
 #if !defined(CURL_DISABLE_ALTSVC) || defined(USE_HTTPSRR)
 
+/**
+ * @brief Map an ALPN protocol name to the internal ALPN identifier.
+ *
+ * Recognizes "h1", "h2" and "h3" as well as "http/1.1" (mapped to h1).
+ *
+ * @param[in] name Protocol name bytes, not necessarily NUL terminated.
+ * @param[in] len  Number of bytes in name.
+ * @return ALPN_h1, ALPN_h2 or ALPN_h3 for a known name.
+ * @return ALPN_none if the name is unknown.
+ * @note Only compiled with alt-svc or HTTPS-RR support.
+ */
 enum alpnid Curl_alpn2alpnid(const unsigned char *name, size_t len)
 {
   if(len == 2) {
@@ -57,7 +80,21 @@ enum alpnid Curl_alpn2alpnid(const unsigned char *name, size_t len)
 
 #endif
 
-/* Milliseconds left of the connect timeout. */
+/**
+ * @brief Milliseconds left of the connect timeout.
+ * @internal
+ *
+ * Used for connection filters that connect after the transfer left the
+ * initial connect phase (e.g. the second FTP socket). The timeout is
+ * CURLOPT_CONNECTTIMEOUT_MS or the default, counted from
+ * conn->connect_start_ms.
+ *
+ * @param[in] data Transfer with a connection attached.
+ * @param[in] pnow Current time.
+ * @return Milliseconds left; negative when expired. A value of exactly 0
+ *         is returned as -1 since 0 means "no limit" to callers.
+ * @pre data->conn->connect_start_ms >= 0
+ */
 static timediff_t connect_left_ms(struct Curl_easy *data,
                                   const struct curltime *pnow)
 {
@@ -71,12 +108,20 @@ static timediff_t connect_left_ms(struct Curl_easy *data,
   return left_ms ? left_ms : -1; /* 0 is "no limit", fake 1 ms expiry */
 }
 
-/*
- * timeleft_now_ms() returns the amount of milliseconds left allowed for the
- * transfer/connection. If the value is 0, there is no timeout (ie there is
- * infinite time left). If the value is negative, the timeout time has already
- * elapsed.
+/**
+ * @brief Milliseconds left allowed for the transfer/connection.
+ * @internal
  *
+ * Combines the connect timeout (while connecting) with the overall
+ * transfer timeout (CURLOPT_TIMEOUT) and returns the smaller of the two.
+ * While the connection is shutting down, the shutdown time limit is used.
+ *
+ * @param[in] data Transfer.
+ * @param[in] pnow Current time.
+ * @return 0 if there is no timeout, i.e. infinite time is left.
+ * @return A negative value if the timeout time has already elapsed.
+ * @return Otherwise the positive number of milliseconds left.
+ * @note Exact expiry is reported as -1 to keep it distinct from 0.
  * @unittest 1303
  */
 UNITTEST timediff_t timeleft_now_ms(struct Curl_easy *data,
@@ -120,22 +165,48 @@ UNITTEST timediff_t timeleft_now_ms(struct Curl_easy *data,
   return CURLMIN(ctimeleft_ms, timeleft_ms);
 }
 
+/**
+ * @brief Time left for the transfer/connection, using the current time.
+ *
+ * @param[in] data Transfer.
+ * @return Same values as timeleft_now_ms(): 0 for no limit, negative if
+ *         expired, else the milliseconds left.
+ * @see Curl_timeleft_now_ms()
+ */
 timediff_t Curl_timeleft_ms(struct Curl_easy *data)
 {
   return timeleft_now_ms(data, Curl_pgrs_now(data));
 }
 
+/**
+ * @brief Time left for the transfer/connection at a given time.
+ *
+ * @param[in] data Transfer.
+ * @param[in] pnow Time to compute with, avoids another clock query.
+ * @return Same values as timeleft_now_ms(): 0 for no limit, negative if
+ *         expired, else the milliseconds left.
+ * @see Curl_timeleft_ms()
+ */
 timediff_t Curl_timeleft_now_ms(struct Curl_easy *data,
                                 const struct curltime *pnow)
 {
   return timeleft_now_ms(data, pnow);
 }
 
-/*
- * Used to extract socket and connectdata struct for the most recent
- * transfer on the given Curl_easy.
+/**
+ * @brief Get the socket and connection of the most recent transfer.
  *
- * The returned socket will be CURL_SOCKET_BAD in case of failure!
+ * Works for an easy handle that has been used for curl_easy_perform(), or
+ * that is associated with a multi handle and whose connection was detached
+ * with CURLOPT_CONNECT_ONLY.
+ *
+ * @param[in]  data  Transfer.
+ * @param[out] connp Receives the connection, or NULL if there is none. May
+ *                   be NULL itself if the caller is not interested.
+ * @return The first socket of the connection.
+ * @return CURL_SOCKET_BAD in case of failure.
+ * @warning The returned connection is owned by the connection pool and may
+ *          be closed or reused at any time.
  */
 curl_socket_t Curl_getconnectinfo(struct Curl_easy *data,
                                   struct connectdata **connp)
@@ -151,6 +222,17 @@ curl_socket_t Curl_getconnectinfo(struct Curl_easy *data,
   return conn ? conn->sock[FIRSTSOCKET] : CURL_SOCKET_BAD;
 }
 
+/**
+ * @brief Change whether the connection is kept or closed after use.
+ *
+ * @param[in,out] conn Connection to change, must not be NULL.
+ * @param[in]     ctrl One of CONNCTRL_CONN_KEEP (clear the close flag),
+ *                     CONNCTRL_CONN_CLOSE (set it) or CONNCTRL_STREAM_CLOSE
+ *                     (close, but only if the connection is not
+ *                     multiplexed, as a stream close then does not affect
+ *                     the connection).
+ * @note Any other value triggers an assertion in debug builds.
+ */
 void Curl_conncontrol(struct connectdata *conn, int ctrl)
 {
   if(!conn) {
@@ -175,6 +257,24 @@ void Curl_conncontrol(struct connectdata *conn, int ctrl)
   }
 }
 
+/**
+ * @brief Set up the connection filter chain for a socket index.
+ *
+ * Installs HTTPS-specific filters for https, otherwise the default
+ * setup filter, and adds a DNS resolve filter for the first peer so
+ * resolving starts right away. Does not connect yet.
+ *
+ * @param[in,out] data      Transfer.
+ * @param[in,out] conn      Connection to set up.
+ * @param[in]     sockindex FIRSTSOCKET or SECONDARYSOCKET.
+ * @param[in]     ssl_mode  CURL_CF_SSL_* mode for the filters.
+ * @return CURLE_OK on success.
+ * @return CURLE_FAILED_INIT if the connection has no first peer.
+ * @return Any error from creating the filters, e.g. CURLE_OUT_OF_MEMORY.
+ * @pre conn->scheme is set and no filter exists yet for sockindex.
+ * @post On success conn->cfilter[sockindex] is not NULL.
+ * @see Curl_conn_connect()
+ */
 CURLcode Curl_conn_setup(struct Curl_easy *data,
                          struct connectdata *conn,
                          int8_t sockindex,
@@ -226,6 +326,15 @@ out:
 }
 
 #ifdef CURLVERBOSE
+/**
+ * @brief Log the established connection (verbose builds only).
+ * @internal
+ *
+ * @param[in] data Transfer.
+ * @param[in] cf   Connected filter to query for address information.
+ * @return CURLE_OK on success or if not verbose.
+ * @return The error from querying the IP information.
+ */
 static CURLcode conn_connect_trace(struct Curl_easy *data,
                                    struct Curl_cfilter *cf)
 {
@@ -249,7 +358,13 @@ static CURLcode conn_connect_trace(struct Curl_easy *data,
 #endif
 
 /**
- * Update connection statistics
+ * @brief Update connection statistics.
+ * @internal
+ *
+ * Statistics are only gathered for the first socket, not the second.
+ *
+ * @param[in,out] data      Transfer.
+ * @param[in]     sockindex Socket index the report is about.
  */
 static void conn_report_stats(struct Curl_easy *data, int sockindex)
 {
@@ -259,6 +374,16 @@ static void conn_report_stats(struct Curl_easy *data, int sockindex)
   }
 }
 
+/**
+ * @brief Report a failed connect attempt to the filters and statistics.
+ *
+ * Only filters connected at the IP level have information to update.
+ * Filters still racing for a connection, such as happy eyeballing, pass
+ * the request on to a connected one only.
+ *
+ * @param[in,out] data      Transfer.
+ * @param[in]     sockindex Socket index; only FIRSTSOCKET is acted upon.
+ */
 void Curl_conn_report_failed(struct Curl_easy *data, int8_t sockindex)
 {
   if(!data->conn || (sockindex != FIRSTSOCKET))
@@ -271,11 +396,38 @@ void Curl_conn_report_failed(struct Curl_easy *data, int8_t sockindex)
   conn_report_stats(data, sockindex);
 }
 
+/**
+ * @brief Drive the connection filter chain towards "connected".
+ *
+ * Calls the filter's do_connect() until it reports done. In blocking mode
+ * it polls the socket (in slices of at most one second) and honors the
+ * remaining timeout. In non-blocking mode it returns after one attempt.
+ * On success the setup filters are removed and connection info and
+ * statistics are stored at the connection.
+ *
+ * @param[in,out] data      Transfer with data->conn set.
+ * @param[in]     sockindex FIRSTSOCKET or SECONDARYSOCKET.
+ * @param[in]     blocking  TRUE to wait until connected or failed.
+ * @param[out]    done      TRUE if the connection is fully established.
+ * @return CURLE_OK on success, check done to see if connecting finished.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT for an invalid sockindex.
+ * @return CURLE_FAILED_INIT if no filter chain exists or a transfer that
+ *         requires SSL is not connected via SSL.
+ * @return CURLE_OPERATION_TIMEDOUT if the connect timeout expired.
+ * @return CURLE_COULDNT_CONNECT if polling failed.
+ * @return Any other error returned by a filter.
+ * @note Protocols without network (PROTOPT_NONETWORK) return done at once.
+ * @see Curl_conn_setup()
+ */
 CURLcode Curl_conn_connect(struct Curl_easy *data,
                            int8_t sockindex,
                            bool blocking,
                            bool *done)
 {
+/**
+ * @brief Number of poll entries kept on the stack while connecting.
+ * @internal
+ */
 #define CF_CONN_NUM_POLLS_ON_STACK 5
   struct pollfd a_few_on_stack[CF_CONN_NUM_POLLS_ON_STACK];
   struct easy_pollset ps;
@@ -401,6 +553,14 @@ out:
   return result;
 }
 
+/**
+ * @brief Mark the connection as multiplexed.
+ *
+ * When the flag changes and the connection is attached to a multi handle,
+ * the multi handle is notified so waiting transfers can be reconsidered.
+ *
+ * @param[in,out] conn Connection to mark.
+ */
 void Curl_conn_set_multiplex(struct connectdata *conn)
 {
   if(!conn->bits.multiplex) {
@@ -411,6 +571,14 @@ void Curl_conn_set_multiplex(struct connectdata *conn)
   }
 }
 
+/**
+ * @brief Get the origin peer for a socket index.
+ *
+ * @param[in] conn      Connection.
+ * @param[in] sockindex FIRSTSOCKET or SECONDARYSOCKET.
+ * @return The origin peer of that socket.
+ * @note The returned pointer is owned by the connection.
+ */
 struct Curl_peer *Curl_conn_get_origin(struct connectdata *conn,
                                        int8_t sockindex)
 {
@@ -418,6 +586,16 @@ struct Curl_peer *Curl_conn_get_origin(struct connectdata *conn,
     conn->origin2 : conn->origin;
 }
 
+/**
+ * @brief Get the peer to connect to for a socket index.
+ *
+ * This is the "via" peer if one is set (e.g. from CURLOPT_CONNECT_TO),
+ * otherwise the origin.
+ *
+ * @param[in] conn      Connection.
+ * @param[in] sockindex FIRSTSOCKET or SECONDARYSOCKET.
+ * @return The destination peer, owned by the connection.
+ */
 struct Curl_peer *Curl_conn_get_destination(struct connectdata *conn,
                                             int8_t sockindex)
 {
@@ -426,6 +604,16 @@ struct Curl_peer *Curl_conn_get_destination(struct connectdata *conn,
     (conn->via_peer ? conn->via_peer : conn->origin);
 }
 
+/**
+ * @brief Get the first peer the connection must talk to.
+ *
+ * With a SOCKS or HTTP proxy this is the proxy peer, otherwise the same
+ * as Curl_conn_get_destination().
+ *
+ * @param[in] conn      Connection.
+ * @param[in] sockindex FIRSTSOCKET or SECONDARYSOCKET.
+ * @return The first peer, owned by the connection, or NULL if not set.
+ */
 struct Curl_peer *Curl_conn_get_first_peer(struct connectdata *conn,
                                            int8_t sockindex)
 {

@@ -21,6 +21,21 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file hash.c
+ * @brief Chained hash table with byte-string and socket keys.
+ *
+ * Implements struct Curl_hash: a fixed-slot-count hash table whose buckets
+ * are singly linked lists of struct Curl_hash_element. Keys are copied into
+ * the element, values are stored as pointers and released through a
+ * destructor. Two key types are supported: arbitrary byte strings and
+ * curl_socket_t values. The table array is allocated lazily on first add.
+ *
+ * @note Not thread-safe; callers must serialize access.
+ * @warning The byte-string hash is seeded randomly at global init
+ *          (Curl_hash_global_init()) to resist hash flooding.
+ * @see hash.h
+ */
 #include "curl_setup.h"
 
 #include <stddef.h> /* for offsetof() */
@@ -29,33 +44,88 @@
 #include "rand.h"
 
 /* random patterns for API verification */
+/**
+ * @brief Debug-only magic patterns for API verification.
+ *
+ * HASHINIT marks an initialized struct Curl_hash, ITERINIT marks an
+ * initialized iterator. They catch use of uninitialized objects.
+ * @internal
+ */
 #ifdef DEBUGBUILD
 #define HASHINIT 0x7017e781
 #define ITERINIT 0x5FEDCBA9
 #endif
 
 
+/**
+ * @brief Function computing the slot index for a key.
+ * @internal
+ * @param[in] key        Key bytes.
+ * @param[in] key_length Length of the key in bytes.
+ * @param[in] slots_num  Number of slots in the table (must be non-zero).
+ * @return Slot index in the range [0, slots_num).
+ */
 typedef size_t (*hash_function)(const void *key,
                                 size_t key_length,
                                 size_t slots_num);
 
+/**
+ * @brief Function comparing two keys for equality.
+ * @internal
+ * @param[in] key1     First key.
+ * @param[in] key1_len Length of the first key.
+ * @param[in] key2     Second key.
+ * @param[in] key2_len Length of the second key.
+ * @return Non-zero if the keys are equal, 0 otherwise.
+ */
 typedef size_t (*comp_function)(const void *key1,
                                 size_t key1_len,
                                 const void *key2,
                                 size_t key2_len);
 
 /* Curl_hash stores its type in a uint8_t. */
+/**
+ * @brief Compile-time check that all hash types fit the uint8_t type field.
+ *
+ * Curl_hash stores its type in a uint8_t. The array size becomes -1 (a
+ * compile error) if CURL_HASH_TYPE_LAST grows beyond that.
+ * @internal
+ */
 typedef char hash_types_fit_uint8[
   ((CURL_HASH_TYPE_LAST - 1) <= UINT8_MAX) ? 1 : -1];
 
+/**
+ * @brief Pair of functions implementing one hash key type.
+ * @internal
+ */
 struct hash_functions {
+  /** @brief Computes the slot for a key. */
   hash_function hash;
+  /** @brief Compares two keys for equality. */
   comp_function compare;
 };
 
 /* set at global init, read-only afterwards */
+/**
+ * @brief Random seed mixed into the string hash.
+ *
+ * Set once by Curl_hash_global_init() and read-only afterwards, so no
+ * locking is needed for reads.
+ * @internal
+ */
 static size_t hash_seed;
 
+/**
+ * @brief Initialize the global hash seed.
+ *
+ * Draws random bytes to seed the string hash function. Calling it again
+ * after success is a cheap no-op. A seed of 0 is replaced by 1.
+ *
+ * @return CURLE_OK on success (or if already seeded), otherwise the error
+ *         from Curl_rand_bytes().
+ * @post On CURLE_OK the global seed is set and must not change again.
+ * @warning Not thread-safe: call during global initialization only.
+ */
 CURLcode Curl_hash_global_init(void)
 {
   static bool seeded;
@@ -83,7 +153,15 @@ CURLcode Curl_hash_global_init(void)
   return CURLE_OK;
 }
 
-/* @unittest 1603
+/**
+ * @brief Seeded string hash (djb2 variant: h = h * 33 ^ c).
+ * @internal
+ * @param[in] key        Key bytes.
+ * @param[in] key_length Number of bytes in the key.
+ * @param[in] slots_num  Number of slots, must be non-zero.
+ * @param[in] seed       Value XORed into the initial hash state.
+ * @return Slot index in [0, slots_num).
+ * @note @unittest 1603
  */
 UNITTEST size_t hash_str_seeded(const void *key, size_t key_length,
                                 size_t slots_num, size_t seed);
@@ -103,7 +181,15 @@ UNITTEST size_t hash_str_seeded(const void *key, size_t key_length,
   return (h % slots_num);
 }
 
-/* @unittest 1603
+/**
+ * @brief String hash using the global seed.
+ * @internal
+ * @param[in] key        Key bytes.
+ * @param[in] key_length Number of bytes in the key.
+ * @param[in] slots_num  Number of slots, must be non-zero.
+ * @return Slot index in [0, slots_num).
+ * @see hash_str_seeded()
+ * @note @unittest 1603
  */
 UNITTEST size_t hash_str(const void *key, size_t key_length, size_t slots_num);
 UNITTEST size_t hash_str(const void *key, size_t key_length, size_t slots_num)
@@ -112,11 +198,28 @@ UNITTEST size_t hash_str(const void *key, size_t key_length, size_t slots_num)
 }
 
 /* Avoid treating the variable-length key[1] as a one-byte object. */
+/**
+ * @brief Get a pointer to the key bytes stored in an element.
+ * @internal
+ *
+ * Avoids treating the variable-length key[1] member as a one-byte object.
+ *
+ * @param[in] he Hash element.
+ * @return Pointer to the key storage that follows the element header.
+ */
 static char *hash_elem_key(struct Curl_hash_element *he)
 {
   return (char *)he + offsetof(struct Curl_hash_element, key);
 }
 
+/**
+ * @brief Slot function for curl_socket_t keys.
+ * @internal
+ * @param[in] key        Pointer to a curl_socket_t value.
+ * @param[in] key_length Must equal sizeof(curl_socket_t).
+ * @param[in] slots_num  Number of slots, must be non-zero.
+ * @return Slot index, or 0 if the key length is wrong.
+ */
 static size_t hash_socket(const void *key, size_t key_length,
                           size_t slots_num)
 {
@@ -129,6 +232,16 @@ static size_t hash_socket(const void *key, size_t key_length,
   return (size_t)(socket % (curl_socket_t)slots_num);
 }
 
+/**
+ * @brief Compare two curl_socket_t keys.
+ * @internal
+ * @param[in] key1     Pointer to the first socket value.
+ * @param[in] key1_len Length of the first key.
+ * @param[in] key2     Pointer to the second socket value.
+ * @param[in] key2_len Length of the second key.
+ * @return 1 if both lengths are sizeof(curl_socket_t) and the values are
+ *         equal, 0 otherwise.
+ */
 static size_t compare_socket(const void *key1, size_t key1_len,
                              const void *key2, size_t key2_len)
 {
@@ -142,17 +255,37 @@ static size_t compare_socket(const void *key1, size_t key1_len,
   return socket1 == socket2;
 }
 
+/**
+ * @brief Compare two byte-string keys.
+ * @internal
+ * @param[in] key1     First key.
+ * @param[in] key1_len Length of the first key.
+ * @param[in] key2     Second key.
+ * @param[in] key2_len Length of the second key.
+ * @return Non-zero if lengths and contents are identical, 0 otherwise.
+ */
 static size_t compare_bytes(const void *key1, size_t key1_len,
                             const void *key2, size_t key2_len)
 {
   return (key1_len == key2_len) && !memcmp(key1, key2, key1_len);
 }
 
+/**
+ * @brief Function table indexed by hash type (CURL_HASH_TYPE_*).
+ * @internal
+ */
 static const struct hash_functions hash_functions[] = {
   { hash_str, compare_bytes },
   { hash_socket, compare_socket }
 };
 
+/**
+ * @brief Look up the hash and compare functions for a hash type.
+ * @internal
+ * @param[in] type A CURL_HASH_TYPE_* value.
+ * @return The matching function pair; unknown types fall back to the
+ *         byte-string implementation.
+ */
 static const struct hash_functions *hash_get_functions(uint8_t type)
 {
   DEBUGASSERT(CURL_ARRAYSIZE(hash_functions) == CURL_HASH_TYPE_LAST);
@@ -161,6 +294,15 @@ static const struct hash_functions *hash_get_functions(uint8_t type)
   return &hash_functions[type];
 }
 
+/**
+ * @brief Check that a key length is acceptable for a hash type.
+ * @internal
+ * @param[in] type    A CURL_HASH_TYPE_* value.
+ * @param[in] key_len Key length in bytes.
+ * @return TRUE for any length with CURL_HASH_TYPE_BYTES; for
+ *         CURL_HASH_TYPE_SOCKET only if @p key_len is sizeof(curl_socket_t).
+ *         FALSE otherwise.
+ */
 static bool hash_key_is_valid(uint8_t type, size_t key_len)
 {
   return (type == CURL_HASH_TYPE_BYTES) ||
@@ -168,6 +310,10 @@ static bool hash_key_is_valid(uint8_t type, size_t key_len)
      (key_len == sizeof(curl_socket_t)));
 }
 
+/**
+ * Debugging helpers, disabled by default: iterate over all elements and dump
+ * the hash contents to stderr. Enable by changing the preprocessor guard.
+ */
 #if 0 /* useful function for debugging hashes and their contents */
 static struct Curl_hash_element *hash_next_element(
   struct Curl_hash_iterator *iter)
@@ -245,10 +391,18 @@ void Curl_hash_print(struct Curl_hash *h, void (*func)(void *))
 }
 #endif
 
-/* Initializes a hash structure.
+/**
+ * @brief Initialize a hash structure.
  *
- * @unittest: 1602
- * @unittest: 1603
+ * Prepares an empty hash. The slot table is allocated lazily on the first
+ * insert, so this function cannot fail.
+ *
+ * @param[out] h     Hash to initialize.
+ * @param[in]  slots Number of slots (buckets), must be non-zero.
+ * @param[in]  type  Key type, one of the CURL_HASH_TYPE_* values.
+ * @param[in]  dtor  Default destructor for stored values; must not be NULL.
+ * @post The hash is empty and usable; release it with Curl_hash_destroy().
+ * @note @unittest 1602, 1603
  */
 void Curl_hash_init(struct Curl_hash *h,
                     size_t slots,
@@ -270,6 +424,16 @@ void Curl_hash_init(struct Curl_hash *h,
 #endif
 }
 
+/**
+ * @brief Allocate a new element and copy the key into it.
+ * @internal
+ * @param[in] key     Key bytes to copy.
+ * @param[in] key_len Key length in bytes.
+ * @param[in] p       Value pointer to store.
+ * @param[in] dtor    Per-element destructor, or NULL to use the default.
+ * @return The new element, or NULL on out of memory.
+ * @note The key is stored in the same allocation, after the header.
+ */
 static struct Curl_hash_element *hash_elem_create(const void *key,
                                                   size_t key_len,
                                                   void *p,
@@ -290,6 +454,17 @@ static struct Curl_hash_element *hash_elem_create(const void *key,
   return he;
 }
 
+/**
+ * @brief Release the value of an element, keeping the element itself.
+ * @internal
+ *
+ * Calls the element destructor if set, otherwise the hash-wide default
+ * destructor, then sets the value pointer to NULL. Does nothing if the
+ * value is already NULL.
+ *
+ * @param[in]     h  Owning hash.
+ * @param[in,out] he Element whose value is released.
+ */
 static void hash_elem_clear_ptr(struct Curl_hash *h,
                                 struct Curl_hash_element *he)
 {
@@ -304,6 +479,13 @@ static void hash_elem_clear_ptr(struct Curl_hash *h,
   }
 }
 
+/**
+ * @brief Release the value of an element and free the element.
+ * @internal
+ * @param[in]     h  Owning hash.
+ * @param[in,out] he Element to free; invalid after the call.
+ * @pre @p he was already unlinked from its slot chain.
+ */
 static void hash_elem_destroy(struct Curl_hash *h,
                               struct Curl_hash_element *he)
 {
@@ -311,6 +493,14 @@ static void hash_elem_destroy(struct Curl_hash *h,
   curlx_free(he);
 }
 
+/**
+ * @brief Remove an element from its slot chain and update the count.
+ * @internal
+ * @param[in,out] h         Owning hash.
+ * @param[in,out] he_anchor Pointer to the link that points to @p he.
+ * @param[in]     he        Element to unlink.
+ * @note The element is not freed.
+ */
 static void hash_elem_unlink(struct Curl_hash *h,
                              struct Curl_hash_element **he_anchor,
                              struct Curl_hash_element *he)
@@ -319,6 +509,13 @@ static void hash_elem_unlink(struct Curl_hash *h,
   --h->size;
 }
 
+/**
+ * @brief Insert an element at the head of a slot chain.
+ * @internal
+ * @param[in,out] h         Owning hash.
+ * @param[in,out] he_anchor Slot head pointer to insert at.
+ * @param[in,out] he        Element to link in.
+ */
 static void hash_elem_link(struct Curl_hash *h,
                            struct Curl_hash_element **he_anchor,
                            struct Curl_hash_element *he)
@@ -328,6 +525,24 @@ static void hash_elem_link(struct Curl_hash *h,
   ++h->size;
 }
 
+/**
+ * @brief Insert a value into the hash with a per-element destructor.
+ *
+ * If the key already exists, the old value is released (with its own
+ * destructor) and replaced. The slot table is allocated on first use.
+ *
+ * @param[in,out] h       Initialized hash.
+ * @param[in]     key     Key bytes; they are copied.
+ * @param[in]     key_len Key length in bytes; must be
+ *                        sizeof(curl_socket_t) for socket hashes.
+ * @param[in]     p       Value pointer to store.
+ * @param[in]     dtor    Destructor for this value, or NULL to use the
+ *                        default destructor of the hash.
+ * @return @p p on success, NULL on invalid key length or out of memory.
+ * @retval NULL Failure: the hash is unchanged and @p p is NOT freed.
+ * @warning On success the hash owns @p p and will destroy it.
+ * @see Curl_hash_add()
+ */
 void *Curl_hash_add2(struct Curl_hash *h,
                      const void *key, size_t key_len, void *p,
                      Curl_hash_elem_dtor dtor)
@@ -366,13 +581,20 @@ void *Curl_hash_add2(struct Curl_hash *h,
   return p; /* return the new entry */
 }
 
-/* Insert the data in the hash. If there already was a match in the hash, that
- * data is replaced. This function also "lazily" allocates the table if
- * needed, as it is not done in the _init function (anymore).
+/**
+ * @brief Insert a value into the hash using the default destructor.
  *
- * @unittest: 1305
- * @unittest: 1602
- * @unittest: 1603
+ * If there already was a match in the hash, that data is replaced. The
+ * table is allocated "lazily" if needed, it is not done in
+ * Curl_hash_init().
+ *
+ * @param[in,out] h       Initialized hash.
+ * @param[in]     key     Key bytes; they are copied.
+ * @param[in]     key_len Key length in bytes.
+ * @param[in]     p       Value pointer to store.
+ * @return @p p on success, NULL on failure (caller keeps ownership).
+ * @see Curl_hash_add2()
+ * @note @unittest 1305, 1602, 1603
  */
 void *Curl_hash_add(struct Curl_hash *h,
                     const void *key, size_t key_len, void *p)
@@ -380,10 +602,15 @@ void *Curl_hash_add(struct Curl_hash *h,
   return Curl_hash_add2(h, key, key_len, p, NULL);
 }
 
-/* Remove the identified hash entry.
- * Returns non-zero on failure.
+/**
+ * @brief Remove the identified hash entry and destroy its value.
  *
- * @unittest: 1603
+ * @param[in,out] h       Initialized hash.
+ * @param[in]     key     Key bytes to look up.
+ * @param[in]     key_len Key length in bytes.
+ * @return 0 if an entry was removed, non-zero (1) if the key was not
+ *         found or the key length is invalid.
+ * @note @unittest 1603
  */
 int Curl_hash_delete(struct Curl_hash *h, const void *key, size_t key_len)
 {
@@ -412,9 +639,17 @@ int Curl_hash_delete(struct Curl_hash *h, const void *key, size_t key_len)
   return 1;
 }
 
-/* Retrieves a hash element.
+/**
+ * @brief Retrieve the value stored for a key.
  *
- * @unittest: 1603
+ * @param[in] h       Initialized hash.
+ * @param[in] key     Key bytes to look up.
+ * @param[in] key_len Key length in bytes.
+ * @return The stored value pointer, or NULL if not found, the key length
+ *         is invalid, or the stored value is NULL.
+ * @warning The hash keeps ownership of the returned pointer; it becomes
+ *          invalid when the entry is deleted or replaced.
+ * @note @unittest 1603
  */
 void *Curl_hash_pick(struct Curl_hash *h, const void *key, size_t key_len)
 {
@@ -439,12 +674,16 @@ void *Curl_hash_pick(struct Curl_hash *h, const void *key, size_t key_len)
   return NULL;
 }
 
-/* Destroys all the entries in the given hash and resets its attributes,
- * prepping the given hash for [static|dynamic] deallocation.
+/**
+ * @brief Destroy all entries and free the slot table.
  *
- * @unittest: 1305
- * @unittest: 1602
- * @unittest: 1603
+ * Resets the hash so it can be freed or discarded; the Curl_hash struct
+ * itself is not freed. Every value is released through its destructor.
+ *
+ * @param[in,out] h Initialized hash.
+ * @post The hash has no slots and must be re-initialized before reuse.
+ * @see Curl_hash_clean()
+ * @note @unittest 1305, 1602, 1603
  */
 void Curl_hash_destroy(struct Curl_hash *h)
 {
@@ -457,9 +696,12 @@ void Curl_hash_destroy(struct Curl_hash *h)
   h->slots = 0;
 }
 
-/* Removes all the entries in the given hash.
+/**
+ * @brief Remove all entries but keep the hash usable.
  *
- * @unittest: 1602
+ * @param[in,out] h Hash to empty, may be NULL.
+ * @post The count is 0 and the slot table is retained.
+ * @note @unittest 1602
  */
 void Curl_hash_clean(struct Curl_hash *h)
 {
@@ -478,13 +720,29 @@ void Curl_hash_clean(struct Curl_hash *h)
   }
 }
 
+/**
+ * @brief Get the number of entries in the hash.
+ * @param[in] h Initialized hash.
+ * @return Number of stored elements.
+ */
 size_t Curl_hash_count(struct Curl_hash *h)
 {
   DEBUGASSERT(h->init == HASHINIT);
   return h->size;
 }
 
-/* Cleans all entries that pass the comp function criteria. */
+/**
+ * @brief Remove all entries that pass the comparison function.
+ *
+ * The callback is called for every entry; entries for which it returns
+ * non-zero are unlinked and destroyed.
+ *
+ * @param[in,out] h    Hash to prune, may be NULL.
+ * @param[in]     user Opaque pointer passed as first argument to @p comp.
+ * @param[in]     comp Predicate called with (user, value); return non-zero
+ *                     to remove the entry. If NULL, all entries are removed.
+ * @warning The callback must not modify the hash.
+ */
 void Curl_hash_clean_with_criterium(struct Curl_hash *h, void *user,
                                     int (*comp)(void *, void *))
 {

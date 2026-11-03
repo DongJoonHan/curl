@@ -21,6 +21,21 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file
+ * @brief Implementation of the libcurl "multi" interface.
+ *
+ * This file contains the multi handle (struct Curl_multi): the transfer
+ * state machine (CURLMstate), the poll/wait helpers, the socket-action
+ * API, the per-transfer timeout list and the shared transfer buffers.
+ * @note Public curl_multi_*() entry points lock the multi handle via the
+ * CURL_MAPI_ENTER()/CURL_MAPI_LEAVE() guards. Curl_*() functions are
+ * internal and expect the caller to hold that lock.
+ * @see multiif.h, multihandle.h
+ * @defgroup multi_internal Multi handle internals
+ * @{
+ */
+
 #include "curl_setup.h"
 
 #include "urldata.h"
@@ -49,24 +64,44 @@
 #include "bufref.h"
 #include "curlx/strparse.h"
 
-/* initial multi->xfers table size for a full multi */
+/**
+ * @def CURL_XFER_TABLE_SIZE
+ * @brief Initial size of the multi->xfers table for a full multi.
+ */
 #define CURL_XFER_TABLE_SIZE 128
 
-/* CURL_SOCKET_HASH_TABLE_SIZE should be a prime number. Increasing it from 97
-   to 911 takes on a 32-bit machine 4 x 804 = 3211 more bytes. Still, every
-   curl handle takes 6K memory, therefore this 3K are not significant. */
+/**
+ * @def CURL_SOCKET_HASH_TABLE_SIZE
+ * @brief Size of the socket (event) hash table in a multi handle.
+ * @note Can be overridden at build time.
+ */
 #ifndef CURL_SOCKET_HASH_TABLE_SIZE
 #define CURL_SOCKET_HASH_TABLE_SIZE 911
 #endif
 
+/**
+ * @def CURL_CONNECTION_HASH_SIZE
+ * @brief Size of the connection pool hash of a multi handle.
+ * @note Can be overridden at build time.
+ */
 #ifndef CURL_CONNECTION_HASH_SIZE
 #define CURL_CONNECTION_HASH_SIZE 97
 #endif
 
+/**
+ * @def CURL_DNS_HASH_SIZE
+ * @brief Size of the DNS cache hash of a multi handle.
+ * @note Can be overridden at build time.
+ */
 #ifndef CURL_DNS_HASH_SIZE
 #define CURL_DNS_HASH_SIZE 71
 #endif
 
+/**
+ * @def CURL_TLS_SESSION_SIZE
+ * @brief Number of TLS session cache entries of a multi handle.
+ * @note Can be overridden at build time.
+ */
 #ifndef CURL_TLS_SESSION_SIZE
 #define CURL_TLS_SESSION_SIZE 25
 #endif
@@ -87,10 +122,23 @@ static void multi_xfer_tbl_dump(struct Curl_multi *multi);
 /* Get the # of transfers current in process/pending. */
 static uint32_t multi_xfers_running(struct Curl_multi *multi);
 
-/* function pointer called once when entering a state */
+/**
+ * @typedef mstate_enter_func
+ * @brief Function pointer called once when entering a state.
+ * @param[in] data        The transfer that changes state.
+ * @param[in] from_state  The state the transfer is leaving.
+ * @internal
+ */
 typedef void (*mstate_enter_func)(struct Curl_easy *data,
                                   CURLMstate from_state);
 
+/**
+ * @brief Entry action for MSTATE_CONNECT.
+ * Initializes the transfer for a (new) connect attempt.
+ * @param[in,out] data        The transfer entering the state.
+ * @param[in]     from_state  Previous state (unused).
+ * @internal
+ */
 static void mstate_enter_connect(struct Curl_easy *data,
                                  CURLMstate from_state)
 {
@@ -98,6 +146,14 @@ static void mstate_enter_connect(struct Curl_easy *data,
   Curl_init_CONNECT(data);
 }
 
+/**
+ * @brief Entry action for MSTATE_DID.
+ * Resets chunking and marks the PRETRANSFER (and, when nothing is to be
+ * sent, POSTRANSFER) timers.
+ * @param[in,out] data        The transfer entering the state.
+ * @param[in]     from_state  Previous state (unused).
+ * @internal
+ */
 static void mstate_enter_did(struct Curl_easy *data,
                              CURLMstate from_state)
 {
@@ -108,6 +164,13 @@ static void mstate_enter_did(struct Curl_easy *data,
     Curl_pgrsTime(data, TIMER_POSTRANSFER);
 }
 
+/**
+ * @brief Entry action for MSTATE_DONE.
+ * Notifies the application via CURLMNOTIFY_EASY_DONE.
+ * @param[in,out] data        The transfer entering the state.
+ * @param[in]     from_state  Previous state (unused).
+ * @internal
+ */
 static void mstate_enter_done(struct Curl_easy *data,
                               CURLMstate from_state)
 {
@@ -115,6 +178,17 @@ static void mstate_enter_done(struct Curl_easy *data,
   CURLM_NTFY(data, CURLMNOTIFY_EASY_DONE);
 }
 
+/**
+ * @brief Entry action for MSTATE_COMPLETED.
+ * Fixes up progress timers when COMPLETED was reached directly, sends the
+ * EASY_DONE notification if needed, removes the transfer from the process
+ * and pending sets, frees shared buffers when idle, detaches the
+ * connection and clears all timers.
+ * @param[in,out] data        The transfer entering the state.
+ * @param[in]     from_state  The state being left.
+ * @pre multi_done() already ran, so data->conn is NULL.
+ * @internal
+ */
 static void mstate_enter_completed(struct Curl_easy *data,
                                    CURLMstate from_state)
 {
@@ -146,7 +220,15 @@ static void mstate_enter_completed(struct Curl_easy *data,
   Curl_expire_clear_all(data); /* stop all timers */
 }
 
-/* always use this function to change state, to make debugging easier */
+/**
+ * @brief Change the state of a transfer.
+ * Always use this function (or the multistate() macro) to change state,
+ * to make debugging easier. Runs the matching entry action, if any.
+ * @param[in,out] data   The transfer to change.
+ * @param[in]     state  The new state.
+ * @param[in]     lineno Caller line number (debug builds only).
+ * @internal
+ */
 static void mstate(struct Curl_easy *data, CURLMstate state
 #ifdef DEBUGBUILD
                    , int lineno
@@ -193,11 +275,21 @@ static void mstate(struct Curl_easy *data, CURLMstate state
 #ifndef DEBUGBUILD
 #define multistate(x, y) mstate(x, y)
 #else
+/**
+ * @def multistate
+ * @brief Change transfer state; passes __LINE__ in debug builds.
+ * @see mstate()
+ */
 #define multistate(x, y) mstate(x, y, __LINE__)
 #endif
 
-/* multi->proto_hash destructor. Should never be called as elements
- * MUST be added with their own destructor */
+/**
+ * @brief Destructor for multi->proto_hash entries.
+ * Should never be called as elements MUST be added with their own
+ * destructor.
+ * @param[in] p  The hash entry (unused beyond a debug assert).
+ * @internal
+ */
 static void ph_freeentry(void *p)
 {
   (void)p;
@@ -207,10 +299,12 @@ static void ph_freeentry(void *p)
   DEBUGASSERT(!p);
 }
 
-/*
- * multi_addmsg()
- *
+/**
+ * @brief Queue a completion message for a finished transfer.
  * Called when a transfer is completed. Marks its message as unread.
+ * @param[in,out] multi  The multi handle owning the message list.
+ * @param[in,out] data   The completed transfer.
+ * @internal
  */
 static void multi_addmsg(struct Curl_multi *multi, struct Curl_easy *data)
 {
@@ -221,6 +315,17 @@ static void multi_addmsg(struct Curl_multi *multi, struct Curl_easy *data)
 
 static void multi_timeouts_init(struct Curl_easy *data);
 
+/**
+ * @brief Create a multi handle with explicit hash/table sizes.
+ * @param[in] xfer_table_size  Initial size of the transfer table.
+ * @param[in] ev_hashsize      Size of the socket event hash.
+ * @param[in] chashsize        Size of the connection pool hash.
+ * @param[in] dnssize          Size of the DNS cache hash.
+ * @param[in] sesssize         Size of the TLS session cache.
+ * @return The new multi handle, or NULL on out of memory.
+ * @note On failure everything allocated so far is freed again.
+ * @see curl_multi_init()
+ */
 struct Curl_multi *Curl_multi_handle(uint32_t xfer_table_size,
                                      size_t ev_hashsize,  /* event hash */
                                      size_t chashsize, /* connection hash */
@@ -375,6 +480,11 @@ error:
   return NULL;
 }
 
+/**
+ * @brief Create a multi handle with default sizes.
+ * @return A new CURLM handle, or NULL on failure.
+ * @see curl_multi_cleanup()
+ */
 CURLM *curl_multi_init(void)
 {
   return Curl_multi_handle(CURL_XFER_TABLE_SIZE,
@@ -385,6 +495,13 @@ CURLM *curl_multi_init(void)
 }
 
 #if defined(DEBUGBUILD) && defined(CURLVERBOSE)
+/**
+ * @brief Warn when a verbose build is used with a multi handle.
+ * Only compiled for debug builds with verbose support.
+ * @param[in] multi  The multi handle.
+ * @param[in] data   The transfer to emit the info message for.
+ * @internal
+ */
 static void multi_warn_debug(struct Curl_multi *multi, struct Curl_easy *data)
 {
   if(!multi->warned) {
@@ -398,11 +515,24 @@ static void multi_warn_debug(struct Curl_multi *multi, struct Curl_easy *data)
 #define multi_warn_debug(x, y) Curl_nop_stmt
 #endif
 
+/**
+ * @brief Tell if a transfer is currently connecting.
+ * @param[in] data  The transfer to inspect.
+ * @return TRUE if it is in the CONNECT or CONNECTING state.
+ */
 bool Curl_is_connecting(struct Curl_easy *data)
 {
   return data->mstate < MSTATE_DO;
 }
 
+/**
+ * @brief Set up the internal wakeup mechanism of the multi handle.
+ * Creates the socketpair or eventfd used by curl_multi_wakeup(), if the
+ * platform supports it.
+ * @param[in,out] multi  The multi handle.
+ * @return CURLM_OK, or CURLM_WAKEUP_FAILURE if setup failed.
+ * @internal
+ */
 static CURLMcode multi_assess_wakeup(struct Curl_multi *multi)
 {
 #ifdef ENABLE_INTERNAL_WAKEUP
@@ -414,6 +544,14 @@ static CURLMcode multi_assess_wakeup(struct Curl_multi *multi)
   return CURLM_OK;
 }
 
+/**
+ * @brief Register a transfer in the multi handle's transfer table.
+ * Assigns a transfer id (mid) and grows the table when needed.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer to add.
+ * @return CURLM_OK, CURLM_OUT_OF_MEMORY or CURLM_ADDED_ALREADY.
+ * @internal
+ */
 static CURLMcode multi_xfers_add(struct Curl_multi *multi,
                                  struct Curl_easy *data)
 {
@@ -468,6 +606,20 @@ static CURLMcode multi_xfers_add(struct Curl_multi *multi,
   return CURLM_OK;
 }
 
+/**
+ * @brief Add a transfer to a multi handle (internal).
+ * Sets up the admin handle on first use, registers the transfer, clones
+ * timeouts, and moves it to MSTATE_INIT.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer to add.
+ * @return CURLM_OK or a CURLMcode error:
+ *  - CURLM_BAD_HANDLE for invalid handles
+ *  - CURLM_ADDED_ALREADY if already part of a multi
+ *  - CURLM_RECURSIVE_API_CALL if called from a callback
+ *  - CURLM_OUT_OF_MEMORY on allocation failure
+ * @warning The transfer must not be used by another thread meanwhile.
+ * @see Curl_multi_remove_handle()
+ */
 CURLMcode Curl_multi_add_handle(struct Curl_multi *multi,
                                 struct Curl_easy *data)
 {
@@ -575,6 +727,14 @@ CURLMcode Curl_multi_add_handle(struct Curl_multi *multi,
   return CURLM_OK;
 }
 
+/**
+ * @brief Add an easy handle to a multi handle (public API).
+ * @param[in,out] m     The multi handle.
+ * @param[in,out] curl  The easy handle to add.
+ * @return CURLM_OK on success, otherwise a CURLMcode error.
+ * @note The easy handle must not already belong to another multi handle.
+ * @see curl_multi_remove_handle()
+ */
 CURLMcode curl_multi_add_handle(CURLM *m, CURL *curl)
 {
   struct Curl_mapi_guard guard;
@@ -592,10 +752,23 @@ CURLMcode curl_multi_add_handle(CURLM *m, CURL *curl)
   return mresult;
 }
 
+/**
+ * @struct multi_done_ctx
+ * @brief Context passed to multi_done_locked() through the conn pool.
+ */
 struct multi_done_ctx {
   BIT(premature);
 };
 
+/**
+ * @brief Decide whether a connection must be closed after a transfer.
+ * @param[in] conn       The connection used by the transfer.
+ * @param[in] data       The transfer that is done with it.
+ * @param[in] premature  TRUE if the transfer ended before completion.
+ * @return TRUE if the connection should be closed, FALSE if it may be
+ *         kept for reuse.
+ * @internal
+ */
 static bool multi_conn_should_close(struct connectdata *conn,
                                     struct Curl_easy *data,
                                     bool premature)
@@ -633,6 +806,19 @@ static bool multi_conn_should_close(struct connectdata *conn,
   return FALSE;
 }
 
+/**
+ * @brief Finish a transfer's use of a connection, pool lock held.
+ * Runs the protocol done handler and either closes the connection or
+ * returns it to the pool.
+ * @param[in,out] data      The transfer.
+ * @param[in,out] conn      The connection to hand back.
+ * @param[in]     userdata  A struct multi_done_ctx.
+ * @param[in]     pnow      The current time.
+ * @return A cpool_do_result telling the pool whether the connection was
+ *         removed.
+ * @pre The connection pool lock is held.
+ * @internal
+ */
 static cpool_do_result multi_done_locked(struct Curl_easy *data,
                                          struct connectdata *conn,
                                          void *userdata,
@@ -671,6 +857,17 @@ static cpool_do_result multi_done_locked(struct Curl_easy *data,
   }
 }
 
+/**
+ * @brief Called when a transfer is done with its connection.
+ * Handles both successful and failed transfers: closes or releases the
+ * connection, flushes progress and resets per-request state.
+ * @param[in,out] data       The transfer.
+ * @param[in]     status     Result so far; an error if this is called
+ *                           after an error was detected.
+ * @param[in]     premature  TRUE if the transfer did not finish normally.
+ * @return The final CURLcode, possibly replaced by a done-handler error.
+ * @internal
+ */
 static CURLcode multi_done(struct Curl_easy *data,
                            CURLcode status,  /* an error if this is called
                                                 after an error was detected */
@@ -756,6 +953,16 @@ static CURLcode multi_done(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Remove a transfer from a multi handle (internal).
+ * Marks a running transfer as done, drops its connection, cancels timers
+ * and removes it from the transfer table and queues.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer to remove.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_RECURSIVE_API_CALL.
+ * @warning Pending completion messages for the handle are discarded.
+ * @see Curl_multi_add_handle()
+ */
 CURLMcode Curl_multi_remove_handle(struct Curl_multi *multi,
                                    struct Curl_easy *data)
 {
@@ -882,6 +1089,13 @@ CURLMcode Curl_multi_remove_handle(struct Curl_multi *multi,
   return CURLM_OK;
 }
 
+/**
+ * @brief Remove an easy handle from a multi handle (public API).
+ * @param[in,out] m     The multi handle.
+ * @param[in,out] curl  The easy handle to remove.
+ * @return CURLM_OK on success, otherwise a CURLMcode error.
+ * @see curl_multi_add_handle()
+ */
 CURLMcode curl_multi_remove_handle(CURLM *m, CURL *curl)
 {
   struct Curl_mapi_guard guard;
@@ -898,17 +1112,23 @@ CURLMcode curl_multi_remove_handle(CURLM *m, CURL *curl)
   return mresult;
 }
 
-/* Return TRUE if the application asked for multiplexing */
+/**
+ * @brief Tell if the application asked for multiplexing.
+ * @param[in] multi  The multi handle (may be NULL).
+ * @return TRUE if CURLMOPT_PIPELINING enables multiplexing.
+ */
 bool Curl_multiplex_wanted(const struct Curl_multi *multi)
 {
   return multi && multi->multiplexing;
 }
 
-/*
- * Curl_detach_connection() removes the given transfer from the connection.
- *
- * This is the only function that should clear data->conn. This will
- * occasionally be called with the data->conn pointer already cleared.
+/**
+ * @brief Remove the given transfer from its connection.
+ * This is the only function that should clear data->conn. It may
+ * occasionally be called with data->conn already cleared.
+ * @param[in,out] data  The transfer to detach.
+ * @post data->conn is NULL.
+ * @see Curl_attach_connection()
  */
 void Curl_detach_connection(struct Curl_easy *data)
 {
@@ -925,12 +1145,16 @@ void Curl_detach_connection(struct Curl_easy *data)
   data->conn = NULL;
 }
 
-/*
- * Curl_attach_connection() attaches this transfer to this connection.
- *
+/**
+ * @brief Attach a transfer to a connection.
  * This is the only function that should assign data->conn.
- * `matched == TRUE` means the transfer's properties match this
- * connection and it is not a temporary attach for maintenance.
+ * @param[in,out] data     The transfer.
+ * @param[in,out] conn     The connection to attach to.
+ * @param[in]     matched  TRUE if the transfer's properties match this
+ *                         connection; FALSE for a temporary attach for
+ *                         maintenance.
+ * @pre data is not attached to another connection.
+ * @see Curl_detach_connection()
  */
 void Curl_attach_connection(struct Curl_easy *data,
                             struct connectdata *conn,
@@ -957,7 +1181,14 @@ void Curl_attach_connection(struct Curl_easy *data,
     conn->scheme->run->attach(data, conn);
 }
 
-/* adjust pollset for rate limits/pauses */
+/**
+ * @brief Adjust a pollset for rate limits and pauses.
+ * Removes the directions that are paused or rate limited.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to adjust.
+ * @return CURLE_OK, or an error if the pollset could not be changed.
+ * @internal
+ */
 static CURLcode multi_adjust_pollset(struct Curl_easy *data,
                                      struct easy_pollset *ps)
 {
@@ -1002,6 +1233,13 @@ static CURLcode multi_adjust_pollset(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Pollset for transfers in the CONNECTING state.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to fill.
+ * @return CURLE_OK or an error from the connection filters.
+ * @internal
+ */
 static CURLcode mstate_connecting_pollset(struct Curl_easy *data,
                                           struct easy_pollset *ps)
 {
@@ -1025,6 +1263,13 @@ static CURLcode mstate_connecting_pollset(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Pollset for transfers in the protocol connect states.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to fill.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode mstate_protocol_pollset(struct Curl_easy *data,
                                         struct easy_pollset *ps)
 {
@@ -1047,6 +1292,13 @@ static CURLcode mstate_protocol_pollset(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Pollset for transfers in the DOING state.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to fill.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode mstate_do_pollset(struct Curl_easy *data,
                                   struct easy_pollset *ps)
 {
@@ -1066,6 +1318,13 @@ static CURLcode mstate_do_pollset(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Pollset for transfers in the DOING_MORE state.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to fill.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode mstate_domore_pollset(struct Curl_easy *data,
                                       struct easy_pollset *ps)
 {
@@ -1085,6 +1344,13 @@ static CURLcode mstate_domore_pollset(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Pollset for transfers in the PERFORMING state.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to fill.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode mstate_perform_pollset(struct Curl_easy *data,
                                        struct easy_pollset *ps)
 {
@@ -1111,6 +1377,12 @@ static CURLcode mstate_perform_pollset(struct Curl_easy *data,
 }
 
 #ifdef CURLVERBOSE
+/**
+ * @brief Count the entries in a transfer's timeout list.
+ * @param[in] timeouts  The timeout list.
+ * @return Number of nodes in the list.
+ * @internal
+ */
 static size_t multi_timeouts_count(struct expire_timers *timeouts)
 {
   size_t n = 0;
@@ -1121,8 +1393,14 @@ static size_t multi_timeouts_count(struct expire_timers *timeouts)
 }
 #endif
 
-/* Initializes `poll_set` with the current socket poll actions needed
- * for transfer `data`. */
+/**
+ * @brief Initialize a pollset with the sockets a transfer waits on.
+ * Initializes `ps` with the current socket poll actions needed for
+ * transfer `data`, based on its state.
+ * @param[in]     data  The transfer.
+ * @param[in,out] ps    The pollset to (re)build.
+ * @return CURLM_OK or CURLM_OUT_OF_MEMORY.
+ */
 CURLMcode Curl_multi_pollset(struct Curl_easy *data,
                              struct easy_pollset *ps)
 {
@@ -1238,6 +1516,16 @@ CURLMcode Curl_multi_pollset(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief Extract fd_sets for select() from a multi handle.
+ * @param[in]     m            The multi handle.
+ * @param[in,out] read_fd_set  Read set to add sockets to.
+ * @param[in,out] write_fd_set Write set to add sockets to.
+ * @param[in,out] exc_fd_set   Exception set to add sockets to.
+ * @param[out]    max_fd       Highest fd added, or -1 if none.
+ * @return CURLM_OK or a CURLMcode error such as CURLM_BAD_HANDLE.
+ * @note Prefer curl_multi_poll() or the socket API on large fd counts.
+ */
 CURLMcode curl_multi_fdset(CURLM *m,
                            fd_set *read_fd_set, fd_set *write_fd_set,
                            fd_set *exc_fd_set, int *max_fd)
@@ -1293,6 +1581,14 @@ CURLMcode curl_multi_fdset(CURLM *m,
   return mresult;
 }
 
+/**
+ * @brief Retrieve the sockets curl waits for, as curl_waitfd array.
+ * @param[in]  m         The multi handle.
+ * @param[out] ufds      Array to fill (may be NULL to only count).
+ * @param[in]  size      Capacity of ufds.
+ * @param[out] fd_count  Number of fds needed/written (may be NULL).
+ * @return CURLM_OK, CURLM_OUT_OF_MEMORY or CURLM_BAD_FUNCTION_ARGUMENT.
+ */
 CURLMcode curl_multi_waitfds(CURLM *m,
                              struct curl_waitfd *ufds,
                              unsigned int size,
@@ -1345,11 +1641,15 @@ out:
 }
 
 #ifdef USE_WINSOCK
-/* Reset FD_WRITE for TCP sockets. Nothing is actually sent. UDP sockets cannot
- * be reset this way because an empty datagram would be sent. #9203
+/**
+ * @brief Reset FD_WRITE for TCP sockets (Windows). Nothing is sent.
+ * UDP sockets cannot be reset this way because an empty datagram would
+ * be sent. See #9203.
  *
  * "On Windows the internal state of FD_WRITE as returned from
  * WSAEnumNetworkEvents is only reset after successful send()."
+ * @param[in] s  The socket to reset.
+ * @internal
  */
 static void reset_socket_fdwrite(curl_socket_t s)
 {
@@ -1359,6 +1659,19 @@ static void reset_socket_fdwrite(curl_socket_t s)
     swrite(s, NULL, 0);
 }
 
+/**
+ * @brief Wait for socket activity using select() on Windows.
+ * @param[in,out] multi         The multi handle.
+ * @param[in]     cpfds         The curl sockets to wait on.
+ * @param[in]     curl_nfds     Number of curl sockets.
+ * @param[in,out] extra_fds     Application supplied extra fds.
+ * @param[in]     extra_nfds    Number of extra fds.
+ * @param[in]     timeout_ms    Maximum wait time in milliseconds.
+ * @param[in]     extrawait     Wait even if there is no socket.
+ * @param[out]    pnevents      Number of events that occurred.
+ * @return CURLM_OK, or CURLM_OUT_OF_MEMORY / CURLM_WAKEUP_FAILURE.
+ * @internal
+ */
 static CURLMcode multi_winsock_select(struct Curl_multi *multi,
                                       struct curl_pollfds *cpfds,
                                       unsigned int curl_nfds,
@@ -1467,6 +1780,19 @@ out:
 
 #else /* USE_WINSOCK */
 
+/**
+ * @brief Wait for socket activity using poll() (or select fallback).
+ * @param[in,out] multi         The multi handle.
+ * @param[in]     cpfds         The curl sockets to wait on.
+ * @param[in]     curl_nfds     Number of curl sockets.
+ * @param[in,out] extra_fds     Application supplied extra fds.
+ * @param[in]     extra_nfds    Number of extra fds.
+ * @param[in]     timeout_ms    Maximum wait time in milliseconds.
+ * @param[in]     extrawait     Wait even if there is no socket.
+ * @param[out]    pnevents      Number of events that occurred.
+ * @return CURLM_OK, or CURLM_OUT_OF_MEMORY / CURLM_WAKEUP_FAILURE.
+ * @internal
+ */
 static CURLMcode multi_posix_poll(struct Curl_multi *multi,
                                   struct curl_pollfds *cpfds,
                                   unsigned int curl_nfds,
@@ -1518,8 +1844,26 @@ out:
 
 #endif /* !USE_WINSOCK */
 
+/**
+ * @def NUM_POLLS_ON_STACK
+ * @brief Number of pollfd entries kept on the stack in multi_wait().
+ */
 #define NUM_POLLS_ON_STACK 10
 
+/**
+ * @brief Common implementation of curl_multi_wait() and _poll().
+ * Collects the sockets of all transfers, adds the application's extra fds
+ * and optionally the wakeup fd, then waits for activity or timeout.
+ * @param[in,out] multi       The multi handle.
+ * @param[in,out] extra_fds   Extra fds supplied by the application.
+ * @param[in]     extra_nfds  Number of extra fds.
+ * @param[in]     timeout_ms  Maximum wait time in milliseconds.
+ * @param[out]    ret         Number of events (may be NULL).
+ * @param[in]     extrawait   When no socket exists, still wait.
+ * @return CURLM_OK, CURLM_BAD_FUNCTION_ARGUMENT, CURLM_OUT_OF_MEMORY or
+ *         CURLM_WAKEUP_FAILURE.
+ * @internal
+ */
 static CURLMcode multi_wait(struct Curl_multi *multi,
                             struct curl_waitfd extra_fds[],
                             unsigned int extra_nfds,
@@ -1642,6 +1986,17 @@ out:
   return mresult;
 }
 
+/**
+ * @brief Wait for activity on curl's or extra sockets (public API).
+ * @param[in]     m           The multi handle.
+ * @param[in,out] extra_fds   Extra fds to wait on (may be NULL).
+ * @param[in]     extra_nfds  Number of extra fds.
+ * @param[in]     timeout_ms  Maximum wait time in milliseconds.
+ * @param[out]    ret         Number of fds with events (may be NULL).
+ * @return CURLM_OK or a CURLMcode error.
+ * @note Returns immediately if there is nothing to wait for.
+ * @see curl_multi_poll()
+ */
 CURLMcode curl_multi_wait(CURLM *m,
                           struct curl_waitfd extra_fds[],
                           unsigned int extra_nfds,
@@ -1658,6 +2013,17 @@ CURLMcode curl_multi_wait(CURLM *m,
   return mresult;
 }
 
+/**
+ * @brief Like curl_multi_wait() but waits even without sockets.
+ * Can be interrupted by curl_multi_wakeup().
+ * @param[in]     m           The multi handle.
+ * @param[in,out] extra_fds   Extra fds to wait on (may be NULL).
+ * @param[in]     extra_nfds  Number of extra fds.
+ * @param[in]     timeout_ms  Maximum wait time in milliseconds.
+ * @param[out]    ret         Number of fds with events (may be NULL).
+ * @return CURLM_OK or a CURLMcode error.
+ * @see curl_multi_wakeup()
+ */
 CURLMcode curl_multi_poll(CURLM *m,
                           struct curl_waitfd extra_fds[],
                           unsigned int extra_nfds,
@@ -1674,6 +2040,13 @@ CURLMcode curl_multi_poll(CURLM *m,
   return mresult;
 }
 
+/**
+ * @brief Wake up a thread blocked in curl_multi_poll().
+ * @param[in] m  The multi handle.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_WAKEUP_FAILURE.
+ * @note This is the only multi function that is safe to call from
+ * another thread while the multi handle is in use.
+ */
 CURLMcode curl_multi_wakeup(CURLM *m)
 {
   /* this function is usually called from another thread,
@@ -1701,6 +2074,11 @@ CURLMcode curl_multi_wakeup(CURLM *m)
 }
 
 #ifdef ENABLE_INTERNAL_WAKEUP
+/**
+ * @brief Trigger the multi wakeup mechanism from inside libcurl.
+ * Compiled only when ENABLE_INTERNAL_WAKEUP is set.
+ * @param[in] multi  The multi handle.
+ */
 void Curl_multi_wakeup_internal(struct Curl_multi *multi)
 {
   /* This is expected to be invocable from another thread which
@@ -1712,13 +2090,14 @@ void Curl_multi_wakeup_internal(struct Curl_multi *multi)
 }
 #endif
 
-/*
- * multi_ischanged() is called
- *
- * Returns TRUE/FALSE whether the state is changed to trigger a CONNECT_PEND
- * => CONNECT action.
- *
- * Set 'clear' to TRUE to have it also clear the state variable.
+/**
+ * @brief Check whether CONNECT_PEND transfers should be retried.
+ * Returns TRUE/FALSE whether the state is changed to trigger a
+ * CONNECT_PEND => CONNECT action.
+ * @param[in,out] multi  The multi handle.
+ * @param[in]     clear  Set to TRUE to also clear the state variable.
+ * @return TRUE if the state had changed.
+ * @internal
  */
 static bool multi_ischanged(struct Curl_multi *multi, bool clear)
 {
@@ -1732,12 +2111,12 @@ static bool multi_ischanged(struct Curl_multi *multi, bool clear)
   return retval;
 }
 
-/*
- * Curl_multi_connchanged() is called to tell that there is a connection in
- * this multi handle that has changed state (multiplexing become possible, the
- * number of allowed streams changed or similar), and a subsequent use of this
- * multi handle should move CONNECT_PEND handles back to CONNECT to have them
- * retry.
+/**
+ * @brief Tell the multi that a connection changed state.
+ * Multiplexing became possible, the number of allowed streams changed or
+ * similar. A subsequent use of this multi handle then moves CONNECT_PEND
+ * handles back to CONNECT to have them retry.
+ * @param[in,out] multi  The multi handle.
  */
 void Curl_multi_connchanged(struct Curl_multi *multi)
 {
@@ -1746,6 +2125,13 @@ void Curl_multi_connchanged(struct Curl_multi *multi)
     multi->recheckstate = TRUE;
 }
 
+/**
+ * @brief Add a transfer and run it using an existing connection.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer to add.
+ * @param[in,out] conn   The connection to attach to the transfer.
+ * @return CURLM_OK or a CURLMcode error from adding/performing.
+ */
 CURLMcode Curl_multi_add_perform(struct Curl_multi *multi,
                                  struct Curl_easy *data,
                                  struct connectdata *conn)
@@ -1772,6 +2158,13 @@ CURLMcode Curl_multi_add_perform(struct Curl_multi *multi,
   return mresult;
 }
 
+/**
+ * @brief Run the protocol "do" action (send the request).
+ * @param[in,out] data  The transfer.
+ * @param[out]    done  TRUE when the do phase is complete.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode multi_do(struct Curl_easy *data, bool *done)
 {
   CURLcode result = CURLE_OK;
@@ -1795,6 +2188,13 @@ static CURLcode multi_do(struct Curl_easy *data, bool *done)
  * (to DOING state when there is more work to do)
  */
 
+/**
+ * @brief Run the protocol "do more" action.
+ * @param[in,out] data      The transfer.
+ * @param[out]    complete  Whether the do-more phase finished.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode multi_do_more(struct Curl_easy *data, domore *complete)
 {
   CURLcode result = CURLE_OK;
@@ -1808,8 +2208,16 @@ static CURLcode multi_do_more(struct Curl_easy *data, domore *complete)
   return result;
 }
 
-/*
- * Check whether a timeout occurred, and handle it if it did
+/**
+ * @brief Check whether a timeout occurred, and handle it if it did.
+ * On timeout, the retry logic may decide to try again.
+ * @param[in,out] data           The transfer.
+ * @param[in]     pnow           Current time.
+ * @param[out]    stream_error   Set TRUE if only the stream failed.
+ * @param[out]    result         Error to report on timeout.
+ * @return TRUE if a timeout was handled (result is then set), FALSE
+ *         if no timeout happened.
+ * @internal
  */
 static bool multi_handle_timeout(struct Curl_easy *data,
                                  const struct curltime *pnow,
@@ -1867,6 +2275,13 @@ static bool multi_handle_timeout(struct Curl_easy *data,
  * protocol layer.
  */
 
+/**
+ * @brief Continue a non-blocking protocol connect phase.
+ * @param[in,out] data  The transfer.
+ * @param[out]    done  TRUE when the protocol connect is finished.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode protocol_connecting(struct Curl_easy *data, bool *done)
 {
   CURLcode result = CURLE_OK;
@@ -1887,6 +2302,13 @@ static CURLcode protocol_connecting(struct Curl_easy *data, bool *done)
  * until the DOING phase is done on protocol layer.
  */
 
+/**
+ * @brief Continue a non-blocking protocol "doing" phase.
+ * @param[in,out] data  The transfer.
+ * @param[out]    done  TRUE when the doing phase is finished.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
+ */
 static CURLcode protocol_doing(struct Curl_easy *data, bool *done)
 {
   CURLcode result = CURLE_OK;
@@ -1902,10 +2324,15 @@ static CURLcode protocol_doing(struct Curl_easy *data, bool *done)
   return result;
 }
 
-/*
- * We have discovered that the TCP connection has been successful, we can now
- * proceed with some action.
- *
+/**
+ * @brief Proceed after the TCP connection succeeded.
+ * We have discovered that the TCP connection has been successful, we can
+ * now proceed with some action: start the protocol connect, if any.
+ * @param[in,out] data           The transfer.
+ * @param[out]    protocol_done  TRUE if no further protocol connect
+ *                               is needed.
+ * @return CURLE_OK or an error from the protocol handler.
+ * @internal
  */
 static CURLcode protocol_connect(struct Curl_easy *data, bool *protocol_done)
 {
@@ -1934,8 +2361,11 @@ static CURLcode protocol_connect(struct Curl_easy *data, bool *protocol_done)
   return CURLE_OK;
 }
 
-/*
- * posttransfer() is called immediately after a transfer ends
+/**
+ * @brief Called immediately after a transfer ends.
+ * Restores the SIGPIPE handling and similar per-transfer state.
+ * @param[in,out] data  The transfer.
+ * @internal
  */
 static void multi_posttransfer(struct Curl_easy *data)
 {
@@ -1948,11 +2378,18 @@ static void multi_posttransfer(struct Curl_easy *data)
 #endif
 }
 
-/*
- * multi_follow() handles the URL redirect magic. Pass in the 'newurl' string
- * as given by the remote server and set up the new URL to request.
- *
- * This function DOES NOT FREE the given URL.
+/**
+ * @brief Handle URL redirect magic.
+ * Pass in the 'newurl' string as given by the remote server and set up
+ * the new URL to request.
+ * @param[in,out] data     The transfer.
+ * @param[in]     handler  The scheme handler of the current URL.
+ * @param[in]     newurl   The Location: string.
+ * @param[in]     type     Kind of follow, see transfer.h.
+ * @return CURLE_OK, CURLE_TOO_MANY_REDIRECTS, CURLE_OUT_OF_MEMORY or
+ *         another redirect error.
+ * @warning This function DOES NOT FREE the given URL.
+ * @internal
  */
 static CURLcode multi_follow(struct Curl_easy *data,
                              const struct Curl_scheme *handler,
@@ -1970,6 +2407,14 @@ static CURLcode multi_follow(struct Curl_easy *data,
   return CURLE_TOO_MANY_REDIRECTS;
 }
 
+/**
+ * @brief Check transfer speed against rate limits.
+ * Applies CURLOPT_MAX_*_SPEED_LIMIT and low speed (abort) limits.
+ * @param[in,out] data  The transfer.
+ * @return CURLE_OK, or CURLE_OPERATION_TIMEDOUT if the transfer was too
+ *         slow for too long.
+ * @internal
+ */
 static CURLcode mspeed_check(struct Curl_easy *data)
 {
   if(Curl_rlimit_active(&data->progress.dl.rlimit) ||
@@ -2014,6 +2459,17 @@ static CURLcode mspeed_check(struct Curl_easy *data)
   return CURLE_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_PERFORMING.
+ * Moves data, checks speed limits and decides whether to continue,
+ * finish or retry.
+ * @param[in,out] data           The transfer.
+ * @param[out]    stream_errorp  Set TRUE on a stream-only failure.
+ * @param[out]    resultp        Transfer result on error/completion.
+ * @return CURLM_OK, or CURLM_CALL_MULTI_PERFORM when the state changed
+ *         and should be run again.
+ * @internal
+ */
 static CURLMcode multistate_performing(struct Curl_easy *data,
                                        bool *stream_errorp,
                                        CURLcode *resultp)
@@ -2153,6 +2609,16 @@ static CURLMcode multistate_performing(struct Curl_easy *data,
   return mresult;
 }
 
+/**
+ * @brief State handler for MSTATE_DO.
+ * Starts the protocol "do" action and moves on to DOING, DOING_MORE,
+ * DID or back to CONNECT on retry.
+ * @param[in,out] data           The transfer.
+ * @param[out]    stream_errorp  Set TRUE on a stream-only failure.
+ * @param[out]    resultp        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_do(struct Curl_easy *data,
                                bool *stream_errorp,
                                CURLcode *resultp)
@@ -2289,6 +2755,14 @@ end:
   return mresult;
 }
 
+/**
+ * @brief State handler for MSTATE_RATELIMITING.
+ * Leaves the state once the rate limit timeout has passed.
+ * @param[in,out] data     The transfer.
+ * @param[out]    resultp  Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_ratelimiting(struct Curl_easy *data,
                                          CURLcode *resultp)
 {
@@ -2314,6 +2788,16 @@ static CURLMcode multistate_ratelimiting(struct Curl_easy *data,
   return mresult;
 }
 
+/**
+ * @brief State handler for MSTATE_CONNECT.
+ * Starts or reuses a connection, may queue the transfer as PENDING when
+ * connection limits apply or when waiting for multiplexing.
+ * @param[in,out] multi    The multi handle.
+ * @param[in,out] data     The transfer.
+ * @param[out]    resultp  Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_connect(struct Curl_multi *multi,
                                     struct Curl_easy *data,
                                     CURLcode *resultp)
@@ -2359,7 +2843,17 @@ static CURLMcode multistate_connect(struct Curl_multi *multi,
   return mresult;
 }
 
-/* returns the possibly updated result */
+/**
+ * @brief Decide whether a transfer is finished after an error/result.
+ * Returns the possibly updated result.
+ * @param[in,out] multi         The multi handle.
+ * @param[in,out] data          The transfer.
+ * @param[in]     pnow          Current time.
+ * @param[in]     stream_error  TRUE if only the stream failed.
+ * @param[in]     result        Result of the last operation.
+ * @return The possibly updated CURLcode.
+ * @internal
+ */
 static CURLcode is_finished(struct Curl_multi *multi,
                             struct Curl_easy *data,
                             const struct curltime *pnow,
@@ -2419,6 +2913,13 @@ static CURLcode is_finished(struct Curl_multi *multi,
   return result;
 }
 
+/**
+ * @brief Move a finished transfer to COMPLETED and queue its message.
+ * @param[in,out] multi   The multi handle.
+ * @param[in,out] data    The finished transfer.
+ * @param[in]     result  Final result reported to the application.
+ * @internal
+ */
 static void handle_completed(struct Curl_multi *multi,
                              struct Curl_easy *data,
                              CURLcode result)
@@ -2467,6 +2968,13 @@ static void handle_completed(struct Curl_multi *multi,
     multi_assess_wakeup(multi);
 }
 
+/**
+ * @brief State handler for MSTATE_INIT.
+ * @param[in,out] data    The transfer.
+ * @param[out]    result  Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_init(struct Curl_easy *data, CURLcode *result)
 {
   if(!data->state.really_alive) {
@@ -2491,6 +2999,13 @@ static CURLMcode multistate_init(struct Curl_easy *data, CURLcode *result)
   return CURLM_CALL_MULTI_PERFORM;
 }
 
+/**
+ * @brief State handler for MSTATE_SETUP.
+ * Resets the transfer for starting and moves on to CONNECT.
+ * @param[in,out] data  The transfer.
+ * @return CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_setup(struct Curl_easy *data)
 {
   const struct curltime *pnow = Curl_pgrs_now(data);
@@ -2508,6 +3023,15 @@ static CURLMcode multistate_setup(struct Curl_easy *data)
   return CURLM_CALL_MULTI_PERFORM;
 }
 
+/**
+ * @brief State handler for MSTATE_CONNECTING.
+ * Drives the connection filters until connected or failed.
+ * @param[in,out] data          The transfer.
+ * @param[out]    stream_error  Set TRUE on a stream-only failure.
+ * @param[out]    result        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_connecting(struct Curl_easy *data,
                                        bool *stream_error,
                                        CURLcode *result)
@@ -2542,6 +3066,15 @@ static CURLMcode multistate_connecting(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_PROTOCONNECT.
+ * Starts the protocol level connect (login, handshake).
+ * @param[in,out] data          The transfer.
+ * @param[out]    stream_error  Set TRUE on a stream-only failure.
+ * @param[out]    result        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_protoconnect(struct Curl_easy *data,
                                          bool *stream_error,
                                          CURLcode *result)
@@ -2576,6 +3109,15 @@ static CURLMcode multistate_protoconnect(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_PROTOCONNECTING.
+ * Continues the protocol level connect.
+ * @param[in,out] data          The transfer.
+ * @param[out]    stream_error  Set TRUE on a stream-only failure.
+ * @param[out]    result        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_protoconnecting(struct Curl_easy *data,
                                             bool *stream_error,
                                             CURLcode *result)
@@ -2598,6 +3140,15 @@ static CURLMcode multistate_protoconnecting(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_DOING.
+ * Continues the non-blocking "do" phase.
+ * @param[in,out] data          The transfer.
+ * @param[out]    stream_error  Set TRUE on a stream-only failure.
+ * @param[out]    result        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_doing(struct Curl_easy *data,
                                   bool *stream_error,
                                   CURLcode *result)
@@ -2624,6 +3175,15 @@ static CURLMcode multistate_doing(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_DOING_MORE.
+ * Continues the multi-step "do more" phase of a protocol.
+ * @param[in,out] data          The transfer.
+ * @param[out]    stream_error  Set TRUE on a stream-only failure.
+ * @param[out]    result        Transfer result on error.
+ * @return CURLM_OK or CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_doing_more(struct Curl_easy *data,
                                        bool *stream_error,
                                        CURLcode *result)
@@ -2655,6 +3215,14 @@ static CURLMcode multistate_doing_more(struct Curl_easy *data,
   return CURLM_OK;
 }
 
+/**
+ * @brief State handler for MSTATE_DID.
+ * Moves to PERFORMING, or straight to DONE when no data is to be moved.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer.
+ * @return CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_did(struct Curl_multi *multi,
                                 struct Curl_easy *data)
 {
@@ -2688,6 +3256,14 @@ static CURLMcode multistate_did(struct Curl_multi *multi,
   }
 }
 
+/**
+ * @brief State handler for MSTATE_DONE.
+ * Runs multi_done() and moves the transfer to COMPLETED.
+ * @param[in,out] data     The transfer.
+ * @param[in,out] presult  In: result so far. Out: final result.
+ * @return CURLM_CALL_MULTI_PERFORM.
+ * @internal
+ */
 static CURLMcode multistate_done(struct Curl_easy *data, CURLcode *presult)
 {
   if(data->conn) {
@@ -2717,6 +3293,16 @@ static CURLMcode multistate_done(struct Curl_easy *data, CURLcode *presult)
   return CURLM_CALL_MULTI_PERFORM;
 }
 
+/**
+ * @brief Run the state machine for one transfer as far as possible.
+ * Dispatches to the multistate_*() handlers in a loop while they ask to
+ * be called again, and queues a message when the transfer completes.
+ * @param[in,out] multi        The multi handle.
+ * @param[in,out] data         The transfer to run.
+ * @param[in]     sigpipe_ctx  SIGPIPE handling context.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_RECURSIVE_API_CALL.
+ * @internal
+ */
 static CURLMcode multi_runsingle(struct Curl_multi *multi,
                                  struct Curl_easy *data,
                                  struct Curl_sigpipe_ctx *sigpipe_ctx)
@@ -2896,6 +3482,13 @@ out:
   return mresult;
 }
 
+/**
+ * @brief Run all transfers that are in process.
+ * @param[in,out] multi            The multi handle.
+ * @param[out]    running_handles  Number of still running transfers.
+ * @return CURLM_OK or the first non-OK CURLMcode from a transfer.
+ * @internal
+ */
 static CURLMcode multi_perform(struct Curl_multi *multi,
                                int *running_handles)
 {
@@ -2972,6 +3565,13 @@ static CURLMcode multi_perform(struct Curl_multi *multi,
   return returncode;
 }
 
+/**
+ * @brief Run transfers of a multi handle (public API).
+ * @param[in]  m                The multi handle.
+ * @param[out] running_handles  Number of transfers still running.
+ * @return CURLM_OK or a CURLMcode error.
+ * @see curl_multi_info_read()
+ */
 CURLMcode curl_multi_perform(CURLM *m, int *running_handles)
 {
   struct Curl_mapi_guard guard;
@@ -2984,6 +3584,15 @@ CURLMcode curl_multi_perform(CURLM *m, int *running_handles)
   return mresult;
 }
 
+/**
+ * @brief Destroy a multi handle (public API).
+ * Closes connections, removes remaining transfers and frees all
+ * resources.
+ * @param[in] m  The multi handle (NULL is accepted).
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_RECURSIVE_API_CALL.
+ * @warning The handle is invalid after a successful return. Easy handles
+ * still attached are detached, not freed.
+ */
 CURLMcode curl_multi_cleanup(CURLM *m)
 {
   struct Curl_mapi_guard guard;
@@ -3094,6 +3703,14 @@ out:
  * figure out if a transfer has ended.
  */
 
+/**
+ * @brief Read the next completion message (public API).
+ * @param[in]  m              The multi handle.
+ * @param[out] msgs_in_queue  Messages remaining in the queue (may be NULL).
+ * @return The next CURLMsg, or NULL when there is none.
+ * @warning The returned struct is owned by libcurl and valid only until
+ * the next call into the multi handle.
+ */
 CURLMsg *curl_multi_info_read(CURLM *m, int *msgs_in_queue)
 {
   struct Curl_mapi_guard guard;
@@ -3118,6 +3735,11 @@ CURLMsg *curl_multi_info_read(CURLM *m, int *msgs_in_queue)
   return msg_result;
 }
 
+/**
+ * @brief Tell the multi that a socket is about to be closed.
+ * @param[in,out] data  The transfer owning the socket.
+ * @param[in]     s     The socket that will be closed.
+ */
 void Curl_multi_will_close(struct Curl_easy *data, curl_socket_t s)
 {
   if(data) {
@@ -3129,21 +3751,31 @@ void Curl_multi_will_close(struct Curl_easy *data, curl_socket_t s)
   }
 }
 
+/**
+ * @brief Initialize the timeout list of a transfer.
+ * @param[in,out] data  The transfer.
+ * @internal
+ */
 static void multi_timeouts_init(struct Curl_easy *data)
 {
   data->state.timeouts.first = EXPIRE_LAST;
   data->state.timeouts.splaynode.registered = FALSE;
 }
 
-/*
- * Each Curl_easy has a list of timeouts. The add_next_timeout() is called
+/**
+ * @brief Advance to a transfer's next timeout.
+ * Each Curl_easy has a list of timeouts. add_next_timeout() is called
  * when it has been removed from the splay tree because the timeout has
- * expired. This function is then to advance in the list to pick the next
- * timeout to use (skip the already expired ones) and add this node back to
- * the splay tree again.
+ * expired. It advances in the list to pick the next timeout to use (skip
+ * the already expired ones) and adds this node back to the splay tree.
  *
  * The splay tree only has each Curl_easy as a single node and the nearest
  * timeout is used to sort it on.
+ * @param[in]     pnow   Current time.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The transfer.
+ * @return CURLM_OK or CURLM_OUT_OF_MEMORY.
+ * @internal
  */
 static CURLMcode add_next_timeout(const struct curltime *pnow,
                                   struct Curl_multi *multi,
@@ -3168,6 +3800,12 @@ static CURLMcode add_next_timeout(const struct curltime *pnow,
   return CURLM_OK;
 }
 
+/**
+ * @brief Mark transfers with expired timers as dirty.
+ * @param[in,out] multi  The multi handle.
+ * @param[in]     ts     Current time to compare timers against.
+ * @internal
+ */
 static void multi_mark_expired_as_dirty(struct Curl_multi *multi,
                                         const struct curltime *ts)
 {
@@ -3199,6 +3837,14 @@ static void multi_mark_expired_as_dirty(struct Curl_multi *multi,
   }
 }
 
+/**
+ * @brief Run all transfers marked dirty.
+ * @param[in,out] multi        The multi handle.
+ * @param[in]     sigpipe_ctx  SIGPIPE handling context.
+ * @param[out]    pnum         Number of transfers that were run.
+ * @return CURLM_OK or the first error from a transfer.
+ * @internal
+ */
 static CURLMcode multi_run_dirty(struct Curl_multi *multi,
                                  struct Curl_sigpipe_ctx *sigpipe_ctx,
                                  uint32_t *pnum)
@@ -3247,6 +3893,17 @@ out:
   return mresult;
 }
 
+/**
+ * @brief Common implementation of the socket action API.
+ * @param[in,out] multi            The multi handle.
+ * @param[in]     checkall         TRUE to check all transfers (_all()).
+ * @param[in]     s                Socket with activity or
+ *                                 CURL_SOCKET_TIMEOUT.
+ * @param[in]     ev_bitmask       CURL_CSELECT_* flags for the socket.
+ * @param[out]    running_handles  Number of transfers still running.
+ * @return CURLM_OK or a CURLMcode error.
+ * @internal
+ */
 static CURLMcode multi_socket(struct Curl_multi *multi,
                               bool checkall,
                               curl_socket_t s,
@@ -3334,6 +3991,14 @@ out:
 }
 
 #undef curl_multi_setopt
+/**
+ * @brief Set an option on a multi handle (public API).
+ * @param[in,out] m       The multi handle.
+ * @param[in]     option  The CURLMOPT_* option.
+ * @param[in]     ...     The option value (type depends on option).
+ * @return CURLM_OK, CURLM_BAD_HANDLE, CURLM_UNKNOWN_OPTION,
+ *         CURLM_BAD_FUNCTION_ARGUMENT or CURLM_RECURSIVE_API_CALL.
+ */
 CURLMcode curl_multi_setopt(CURLM *m, CURLMoption option, ...)
 {
   struct Curl_mapi_guard guard;
@@ -3468,6 +4133,14 @@ CURLMcode curl_multi_setopt(CURLM *m, CURLMoption option, ...)
 /* we define curl_multi_socket() in the public multi.h header */
 #undef curl_multi_socket
 
+/**
+ * @brief Deprecated socket action call without event bitmask.
+ * @param[in]  m                The multi handle.
+ * @param[in]  s                Socket with activity.
+ * @param[out] running_handles  Number of transfers still running.
+ * @return CURLM_OK or a CURLMcode error.
+ * @deprecated Use curl_multi_socket_action().
+ */
 CURLMcode curl_multi_socket(CURLM *m, curl_socket_t s, int *running_handles)
 {
   struct Curl_mapi_guard guard;
@@ -3480,6 +4153,15 @@ CURLMcode curl_multi_socket(CURLM *m, curl_socket_t s, int *running_handles)
   return mresult;
 }
 
+/**
+ * @brief Tell the multi handle about socket activity (public API).
+ * @param[in]  m                The multi handle.
+ * @param[in]  s                Socket with activity or
+ *                              CURL_SOCKET_TIMEOUT.
+ * @param[in]  ev_bitmask       CURL_CSELECT_* flags.
+ * @param[out] running_handles  Number of transfers still running.
+ * @return CURLM_OK or a CURLMcode error.
+ */
 CURLMcode curl_multi_socket_action(CURLM *m, curl_socket_t s,
                                    int ev_bitmask, int *running_handles)
 {
@@ -3493,6 +4175,13 @@ CURLMcode curl_multi_socket_action(CURLM *m, curl_socket_t s,
   return mresult;
 }
 
+/**
+ * @brief Deprecated: check all transfers for socket activity.
+ * @param[in]  m                The multi handle.
+ * @param[out] running_handles  Number of transfers still running.
+ * @return CURLM_OK or a CURLMcode error.
+ * @deprecated Use curl_multi_socket_action().
+ */
 CURLMcode curl_multi_socket_all(CURLM *m, int *running_handles)
 {
   struct Curl_mapi_guard guard;
@@ -3505,6 +4194,12 @@ CURLMcode curl_multi_socket_all(CURLM *m, int *running_handles)
   return mresult;
 }
 
+/**
+ * @brief Tell if any transfer is marked dirty.
+ * @param[in] multi  The multi handle.
+ * @return TRUE if there is at least one dirty transfer.
+ * @internal
+ */
 static bool multi_has_dirties(struct Curl_multi *multi)
 {
   uint32_t mid;
@@ -3526,6 +4221,13 @@ static bool multi_has_dirties(struct Curl_multi *multi)
   return FALSE;
 }
 
+/**
+ * @brief Compute the time until the next timeout.
+ * @param[in]  multi             The multi handle.
+ * @param[out] pexire_offset_us  Time offset in microseconds, or -1.
+ * @param[out] timeout_ms        Milliseconds to wait, -1 for none.
+ * @internal
+ */
 static void multi_timeout(struct Curl_multi *multi,
                           timediff_t *pexire_offset_us,
                           int *timeout_ms)
@@ -3566,6 +4268,12 @@ static void multi_timeout(struct Curl_multi *multi,
   }
 }
 
+/**
+ * @brief Get how long to wait before calling into the multi handle.
+ * @param[in]  m           The multi handle.
+ * @param[out] timeout_ms  Milliseconds to wait, or -1 if no timeout.
+ * @return CURLM_OK or CURLM_BAD_HANDLE.
+ */
 CURLMcode curl_multi_timeout(CURLM *m,
                              long *timeout_ms)
 {
@@ -3583,9 +4291,12 @@ CURLMcode curl_multi_timeout(CURLM *m,
   return mresult;
 }
 
-/*
- * Tell the application it should update its timers, if it subscribes to the
- * update timer callback.
+/**
+ * @brief Tell the application to update its timer.
+ * Notifies the application, if it subscribes to the update timer
+ * callback (CURLMOPT_TIMERFUNCTION), when the timeout changed.
+ * @param[in,out] multi  The multi handle.
+ * @return CURLM_OK or CURLM_ABORTED_BY_CALLBACK.
  */
 CURLMcode Curl_update_timer(struct Curl_multi *multi)
 {
@@ -3642,6 +4353,12 @@ CURLMcode Curl_update_timer(struct Curl_multi *multi)
 }
 
 #ifdef DEBUGBUILD
+/**
+ * @brief Check whether a transfer has expired timers.
+ * @param[in] data  The transfer.
+ * @return TRUE if any timeout has expired.
+ * @internal
+ */
 static bool multi_timeouts_check(struct Curl_easy *data)
 {
   struct expire_timers *timeouts = &data->state.timeouts;
@@ -3667,8 +4384,11 @@ static bool multi_timeouts_check(struct Curl_easy *data)
 }
 #endif
 
-/*
- * Remove a given timestamp from the list of timeouts.
+/**
+ * @brief Remove a given timestamp from the list of timeouts.
+ * @param[in,out] data  The transfer.
+ * @param[in]     eid   Id of the timeout to remove.
+ * @internal
  */
 static void multi_clear_timeout(struct Curl_easy *data, expire_id eid)
 {
@@ -3708,9 +4428,15 @@ static void multi_clear_timeout(struct Curl_easy *data, expire_id eid)
   }
 }
 
-/*
- * Add a timestamp to the list of timeouts. Keep the list sorted so that head
- * of list is always the timeout nearest in time.
+/**
+ * @brief Add a timestamp to the list of timeouts.
+ * Keeps the list sorted so that head of list is always the timeout
+ * nearest in time.
+ * @param[in,out] data   The transfer.
+ * @param[in]     stamp  The time the timer fires.
+ * @param[in]     eid    Id of the timeout.
+ * @return CURLM_OK or CURLM_OUT_OF_MEMORY.
+ * @internal
  */
 static CURLMcode multi_set_timeout(struct Curl_easy *data,
                                    const struct curltime *stamp,
@@ -3743,14 +4469,19 @@ static CURLMcode multi_set_timeout(struct Curl_easy *data,
   return CURLM_OK;
 }
 
-/*
- * given a number of milliseconds from now to use to set the 'act before
- * this'-time for the transfer, to be extracted by curl_multi_timeout()
+/**
+ * @brief Set an expire timer from a relative time.
+ * Given a number of milliseconds from now to use to set the 'act before
+ * this'-time for the transfer, to be extracted by curl_multi_timeout().
  *
- * The timeout will be added to a queue of timeouts if it defines a moment in
- * time that is later than the current head of queue.
+ * The timeout will be added to a queue of timeouts if it defines a moment
+ * in time that is later than the current head of queue.
  *
  * Expire replaces a former timeout using the same id if already set.
+ * @param[in,out] data  The transfer.
+ * @param[in]     eid   Id of the timeout.
+ * @param[in]     ms    Milliseconds from `pnow`.
+ * @param[in]     pnow  Current time.
  */
 void Curl_expire_set(struct Curl_easy *data,
                      expire_id eid, timediff_t ms,
@@ -3801,14 +4532,23 @@ void Curl_expire_set(struct Curl_easy *data,
                     timeouts->offset_us[timeouts->first]);
 }
 
+/**
+ * @brief Set an expire timer from the current time.
+ * @param[in,out] data   The transfer.
+ * @param[in]     milli  Milliseconds from now.
+ * @param[in]     eid    Id of the timeout.
+ * @see Curl_expire_set()
+ */
 void Curl_expire(struct Curl_easy *data,
                  timediff_t milli, expire_id eid)
 {
   Curl_expire_set(data, eid, milli, Curl_pgrs_now(data));
 }
 
-/*
- * Removes the expire timer. Marks it as done.
+/**
+ * @brief Remove the expire timer with the given id. Marks it as done.
+ * @param[in,out] data  The transfer.
+ * @param[in]     eid   Id of the timeout to clear.
  */
 void Curl_expire_clear(struct Curl_easy *data, expire_id eid)
 {
@@ -3817,8 +4557,9 @@ void Curl_expire_clear(struct Curl_easy *data, expire_id eid)
   CURL_TRC_TIMER(data, eid, "cleared");
 }
 
-/*
- * Clear ALL timeout values for this handle.
+/**
+ * @brief Clear ALL timeout values for this handle.
+ * @param[in,out] data  The transfer.
  */
 void Curl_expire_clear_all(struct Curl_easy *data)
 {
@@ -3839,6 +4580,14 @@ void Curl_expire_clear_all(struct Curl_easy *data)
   }
 }
 
+/**
+ * @brief Associate application data with a socket (public API).
+ * @param[in,out] m       The multi handle.
+ * @param[in]     sockfd  The socket.
+ * @param[in]     sockp   Application pointer for the socket callback.
+ * @return CURLM_OK, CURLM_BAD_HANDLE, CURLM_BAD_SOCKET or
+ *         CURLM_OUT_OF_MEMORY.
+ */
 CURLMcode curl_multi_assign(CURLM *m, curl_socket_t sockfd,
                             void *sockp)
 {
@@ -3852,6 +4601,12 @@ CURLMcode curl_multi_assign(CURLM *m, curl_socket_t sockfd,
   return mresult;
 }
 
+/**
+ * @brief Move a PENDING transfer back to CONNECT.
+ * @param[in,out] multi  The multi handle.
+ * @param[in,out] data   The pending transfer.
+ * @internal
+ */
 static void move_pending_to_connect(struct Curl_multi *multi,
                                     struct Curl_easy *data)
 {
@@ -3865,19 +4620,24 @@ static void move_pending_to_connect(struct Curl_multi *multi,
   Curl_multi_mark_dirty(data); /* make it run */
 }
 
-/* multi_schedule_pending() moves a handle from PENDING back into the process
-   list and change state to CONNECT.
-
-   We do not move all transfers because that can be a significant amount.
-   Since this is tried every now and then doing too many too often becomes a
-   performance problem.
-
-   When there is a change for connection limits like max host connections etc,
-   this likely only allows one new transfer. When there is a pipewait change,
-   it can potentially allow hundreds of new transfers.
-
-   We could consider an improvement where we store the queue reason and allow
-   more pipewait rechecks than others. */
+/**
+ * @brief Move transfers from PENDING back to CONNECT.
+ * Moves a handle from PENDING back into the process list and changes
+ * state to CONNECT.
+ *
+ * We do not move all transfers because that can be a significant amount.
+ * Since this is tried every now and then doing too many too often becomes
+ * a performance problem.
+ *
+ * When there is a change for connection limits like max host connections
+ * etc, this likely only allows one new transfer. When there is a pipewait
+ * change, it can potentially allow hundreds of new transfers.
+ *
+ * We could consider an improvement where we store the queue reason and
+ * allow more pipewait rechecks than others.
+ * @param[in,out] multi  The multi handle.
+ * @internal
+ */
 static void multi_schedule_pending(struct Curl_multi *multi)
 {
   uint32_t mid = multi->last_pending_mid;
@@ -3914,12 +4674,23 @@ static void multi_schedule_pending(struct Curl_multi *multi)
   }
 }
 
+/**
+ * @brief Maximum number of concurrent streams per connection.
+ * @param[in] multi  The multi handle.
+ * @return The CURLMOPT_MAX_CONCURRENT_STREAMS value.
+ */
 uint32_t Curl_multi_max_concurrent_streams(struct Curl_multi *multi)
 {
   DEBUGASSERT(multi);
   return multi->max_concurrent_streams;
 }
 
+/**
+ * @brief Get all easy handles of a multi handle (public API).
+ * @param[in] m  The multi handle.
+ * @return A NULL-terminated array of handles, or NULL on error.
+ * @warning The caller must free the array with curl_free().
+ */
 CURL **curl_multi_get_handles(CURLM *m)
 {
   struct Curl_mapi_guard guard;
@@ -3950,6 +4721,13 @@ CURL **curl_multi_get_handles(CURLM *m)
   return a;
 }
 
+/**
+ * @brief Get a numeric multi handle information value.
+ * @param[in]  m       The multi handle.
+ * @param[in]  info    The CURLMINFO_* item.
+ * @param[out] pvalue  Receives the value.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_UNKNOWN_OPTION.
+ */
 CURLMcode curl_multi_get_offt(CURLM *m,
                               CURLMinfo_offt info,
                               curl_off_t *pvalue)
@@ -3999,6 +4777,12 @@ out:
   return mresult;
 }
 
+/**
+ * @brief Allocate a fixed-size transfer buffer.
+ * @param[in] len  Size of the buffer in bytes.
+ * @return The new buffer, or NULL on out of memory.
+ * @internal
+ */
 static struct Curl_fixed_buf *fixed_buf_create(size_t len)
 {
   struct Curl_fixed_buf *fbuf;
@@ -4010,6 +4794,15 @@ static struct Curl_fixed_buf *fixed_buf_create(size_t len)
   return fbuf;
 }
 
+/**
+ * @brief Borrow the shared transfer buffer.
+ * @param[in,out] data     The transfer.
+ * @param[out]    pbuf     Receives the buffer.
+ * @param[out]    pbuflen  Receives the buffer length.
+ * @return CURLE_OK, CURLE_OUT_OF_MEMORY or CURLE_FAILED_INIT.
+ * @warning Only one borrower at a time; must be released again.
+ * @see Curl_multi_xfer_buf_release()
+ */
 CURLcode Curl_multi_xfer_buf_borrow(struct Curl_easy *data,
                                     char **pbuf, size_t *pbuflen)
 {
@@ -4052,6 +4845,11 @@ CURLcode Curl_multi_xfer_buf_borrow(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Release the shared transfer buffer.
+ * @param[in,out] data  The transfer.
+ * @param[in]     buf   The buffer that was borrowed.
+ */
 void Curl_multi_xfer_buf_release(struct Curl_easy *data, char *buf)
 {
   (void)buf;
@@ -4062,6 +4860,15 @@ void Curl_multi_xfer_buf_release(struct Curl_easy *data, char *buf)
   data->multi->xfer_buf_borrowed = FALSE;
 }
 
+/**
+ * @brief Borrow the shared upload buffer.
+ * @param[in,out] data     The transfer.
+ * @param[out]    pbuf     Receives the buffer.
+ * @param[out]    pbuflen  Receives the buffer length.
+ * @return CURLE_OK, CURLE_OUT_OF_MEMORY or CURLE_FAILED_INIT.
+ * @warning Only one borrower at a time; must be released again.
+ * @see Curl_multi_xfer_ulbuf_release()
+ */
 CURLcode Curl_multi_xfer_ulbuf_borrow(struct Curl_easy *data,
                                       char **pbuf, size_t *pbuflen)
 {
@@ -4100,6 +4907,11 @@ CURLcode Curl_multi_xfer_ulbuf_borrow(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Release the shared upload buffer.
+ * @param[in,out] data  The transfer.
+ * @param[in]     buf   The buffer that was borrowed.
+ */
 void Curl_multi_xfer_ulbuf_release(struct Curl_easy *data, char *buf)
 {
   (void)buf;
@@ -4110,6 +4922,15 @@ void Curl_multi_xfer_ulbuf_release(struct Curl_easy *data, char *buf)
   data->multi->xfer_ulbuf_borrowed = FALSE;
 }
 
+/**
+ * @brief Borrow the shared socket buffer of at least `blen` bytes.
+ * @param[in,out] data  The transfer.
+ * @param[in]     blen  Minimum size needed.
+ * @param[out]    pbuf  Receives the buffer.
+ * @return CURLE_OK, CURLE_OUT_OF_MEMORY or CURLE_FAILED_INIT.
+ * @warning Only one borrower at a time; must be released again.
+ * @see Curl_multi_xfer_sockbuf_release()
+ */
 CURLcode Curl_multi_xfer_sockbuf_borrow(struct Curl_easy *data,
                                         size_t blen, char **pbuf)
 {
@@ -4144,6 +4965,11 @@ CURLcode Curl_multi_xfer_sockbuf_borrow(struct Curl_easy *data,
   return CURLE_OK;
 }
 
+/**
+ * @brief Release the shared socket buffer.
+ * @param[in,out] data  The transfer.
+ * @param[in]     buf   The buffer that was borrowed.
+ */
 void Curl_multi_xfer_sockbuf_release(struct Curl_easy *data, char *buf)
 {
   DEBUGASSERT(data);
@@ -4159,6 +4985,12 @@ void Curl_multi_xfer_sockbuf_release(struct Curl_easy *data, char *buf)
   }
 }
 
+/**
+ * @brief Free the shared transfer buffers of a multi handle.
+ * @param[in,out] multi  The multi handle.
+ * @pre No buffer is currently borrowed.
+ * @internal
+ */
 static void multi_xfer_bufs_free(struct Curl_multi *multi)
 {
   DEBUGASSERT(multi);
@@ -4170,6 +5002,12 @@ static void multi_xfer_bufs_free(struct Curl_multi *multi)
   multi->xfer_sockbuf_borrowed = FALSE;
 }
 
+/**
+ * @brief Look up a transfer by its id.
+ * @param[in] multi  The multi handle.
+ * @param[in] mid    The transfer id.
+ * @return The transfer, or NULL if unknown.
+ */
 struct Curl_easy *Curl_multi_get_easy(struct Curl_multi *multi,
                                       uint32_t mid)
 {
@@ -4182,11 +5020,23 @@ struct Curl_easy *Curl_multi_get_easy(struct Curl_multi *multi,
   return NULL;
 }
 
+/**
+ * @brief Tell if a transfer is registered in the multi handle.
+ * @param[in] multi  The multi handle.
+ * @param[in] data   The transfer.
+ * @return TRUE if known.
+ */
 bool Curl_multi_knows_easy(struct Curl_multi *multi, struct Curl_easy *data)
 {
   return Curl_uint32_tbl_get(&multi->xfers, data->mid) == data;
 }
 
+/**
+ * @brief Get the number of transfers currently in process/pending.
+ * @param[in] multi  The multi handle.
+ * @return Number of running transfers.
+ * @internal
+ */
 static uint32_t multi_xfers_running(struct Curl_multi *multi)
 {
   if(!multi) {
@@ -4196,6 +5046,11 @@ static uint32_t multi_xfers_running(struct Curl_multi *multi)
   return multi->xfers_alive;
 }
 
+/**
+ * @brief Number of transfers attached to the multi handle.
+ * @param[in] multi  The multi handle.
+ * @return The transfer count.
+ */
 uint32_t Curl_multi_xfers_attached(struct Curl_multi *multi)
 {
   if(!multi || !multi->admin) {
@@ -4206,18 +5061,32 @@ uint32_t Curl_multi_xfers_attached(struct Curl_multi *multi)
   return Curl_uint32_tbl_count(&multi->xfers) - 1;
 }
 
+/**
+ * @brief Mark a transfer dirty so that it runs on the next call.
+ * @param[in,out] data  The transfer.
+ */
 void Curl_multi_mark_dirty(struct Curl_easy *data)
 {
   if(data->multi && data->mid != UINT32_MAX)
     Curl_uint32_bset_add(&data->multi->dirty, data->mid);
 }
 
+/**
+ * @brief Clear the dirty mark of a transfer.
+ * @param[in,out] data  The transfer.
+ */
 void Curl_multi_clear_dirty(struct Curl_easy *data)
 {
   if(data->multi && data->mid != UINT32_MAX)
     Curl_uint32_bset_remove(&data->multi->dirty, data->mid);
 }
 
+/**
+ * @brief Enable a notification type (public API).
+ * @param[in,out] m             The multi handle.
+ * @param[in]     notification  A CURLMNOTIFY_* value.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_UNKNOWN_OPTION.
+ */
 CURLMcode curl_multi_notify_enable(CURLM *m, unsigned int notification)
 {
   struct Curl_mapi_guard guard;
@@ -4230,6 +5099,12 @@ CURLMcode curl_multi_notify_enable(CURLM *m, unsigned int notification)
   return mresult;
 }
 
+/**
+ * @brief Disable a notification type (public API).
+ * @param[in,out] m             The multi handle.
+ * @param[in]     notification  A CURLMNOTIFY_* value.
+ * @return CURLM_OK, CURLM_BAD_HANDLE or CURLM_UNKNOWN_OPTION.
+ */
 CURLMcode curl_multi_notify_disable(CURLM *m, unsigned int notification)
 {
   struct Curl_mapi_guard guard;
@@ -4243,6 +5118,13 @@ CURLMcode curl_multi_notify_disable(CURLM *m, unsigned int notification)
 }
 
 #ifdef DEBUGBUILD
+/**
+ * @brief Debug-dump one entry of the transfer table.
+ * @param[in] multi  The multi handle.
+ * @param[in] mid    Transfer id.
+ * @param[in] entry  The table entry.
+ * @internal
+ */
 static void multi_xfer_dump(struct Curl_multi *multi, uint32_t mid,
                             void *entry)
 {
@@ -4261,6 +5143,11 @@ static void multi_xfer_dump(struct Curl_multi *multi, uint32_t mid,
   }
 }
 
+/**
+ * @brief Debug-dump the whole transfer table.
+ * @param[in] multi  The multi handle.
+ * @internal
+ */
 static void multi_xfer_tbl_dump(struct Curl_multi *multi)
 {
   uint32_t mid;
@@ -4277,3 +5164,5 @@ static void multi_xfer_tbl_dump(struct Curl_multi *multi)
   fflush(stderr);
 }
 #endif /* DEBUGBUILD */
+
+/** @} */

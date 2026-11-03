@@ -21,6 +21,28 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file cfilters.c
+ * @brief Connection filter chain: default methods and chain management.
+ *
+ * A connection filter (struct Curl_cfilter) is one layer of a connection,
+ * for example TCP/UDP socket, TLS, HTTP/2 or an HTTP proxy tunnel. Each
+ * connection has up to two filter chains (indexed by sockindex), stored as
+ * singly linked lists with the top-most (closest to the application)
+ * filter first. Every filter implements the callbacks of its
+ * struct Curl_cftype; the Curl_cf_def_*() functions here are the default
+ * implementations that simply delegate to the next filter in the chain.
+ *
+ * This file also provides the Curl_conn_*() helpers which dispatch
+ * operations (connect, send, recv, poll, query, control events) to the
+ * filter chains of a connection.
+ *
+ * @note Filters are not thread-safe. A chain belongs to one connection,
+ *       which is used by one transfer at a time.
+ * @see cfilters.h
+ * @defgroup cfilters Connection filters
+ * @brief Layered connection handling.
+ */
 #include "curl_setup.h"
 
 #include "urldata.h"
@@ -33,6 +55,20 @@
 #include "select.h"
 #include "curlx/strparse.h"
 
+/**
+ * @brief Default connect callback: connect the next filter, then mark done.
+ *
+ * Delegates to the next filter first. Once that reports completion (or if
+ * there is none), this filter is marked as connected.
+ *
+ * @param[in,out] cf   Filter being connected.
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[out]    done Set TRUE when the filter (and everything below it)
+ *                     is connected, FALSE while still in progress.
+ * @return CURLE_OK on success or while still in progress (check @p done),
+ *         otherwise the error code returned by the next filter.
+ * @post On success with @p done TRUE, cf->connected is TRUE.
+ */
 CURLcode Curl_cf_def_connect(struct Curl_cfilter *cf,
                               struct Curl_easy *data, bool *done)
 {
@@ -54,6 +90,13 @@ CURLcode Curl_cf_def_connect(struct Curl_cfilter *cf,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default shutdown callback: nothing to do, report done.
+ * @param[in,out] cf   Filter being shut down (unused).
+ * @param[in,out] data Easy handle (unused).
+ * @param[out]    done Always set to TRUE.
+ * @return Always CURLE_OK.
+ */
 CURLcode Curl_cf_def_shutdown(struct Curl_cfilter *cf,
                               struct Curl_easy *data, bool *done)
 {
@@ -63,6 +106,13 @@ CURLcode Curl_cf_def_shutdown(struct Curl_cfilter *cf,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default pollset callback: add no sockets to the pollset.
+ * @param[in]     cf   Filter (unused).
+ * @param[in]     data Easy handle (unused).
+ * @param[in,out] ps   Pollset (unchanged).
+ * @return Always CURLE_OK.
+ */
 CURLcode Curl_cf_def_adjust_pollset(struct Curl_cfilter *cf,
                                     struct Curl_easy *data,
                                     struct easy_pollset *ps)
@@ -74,6 +124,13 @@ CURLcode Curl_cf_def_adjust_pollset(struct Curl_cfilter *cf,
   return CURLE_OK;
 }
 
+/**
+ * @brief Default data-pending callback: ask the next filter.
+ * @param[in] cf   Filter being queried.
+ * @param[in] data Easy handle of the transfer.
+ * @return TRUE if a filter further down holds buffered data that can be
+ *         read without socket I/O, FALSE if none or no next filter.
+ */
 bool Curl_cf_def_data_pending(struct Curl_cfilter *cf,
                               const struct Curl_easy *data)
 {
@@ -81,6 +138,17 @@ bool Curl_cf_def_data_pending(struct Curl_cfilter *cf,
     cf->next->cft->has_data_pending(cf->next, data) : FALSE;
 }
 
+/**
+ * @brief Default send callback: pass the data to the next filter.
+ * @param[in,out] cf       Filter being used.
+ * @param[in,out] data     Easy handle of the transfer.
+ * @param[in]     buf      Data to send.
+ * @param[in]     len      Number of bytes in @p buf.
+ * @param[in]     eos      TRUE if this is the end of the stream.
+ * @param[out]    pnwritten Number of bytes accepted by the chain.
+ * @return Result of the next filter, or CURLE_RECV_ERROR (sic) with
+ *         *pnwritten set to 0 if there is no next filter.
+ */
 CURLcode Curl_cf_def_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                           const uint8_t *buf, size_t len, bool eos,
                           size_t *pnwritten)
@@ -91,6 +159,16 @@ CURLcode Curl_cf_def_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   return CURLE_RECV_ERROR;
 }
 
+/**
+ * @brief Default receive callback: read from the next filter.
+ * @param[in,out] cf     Filter being used.
+ * @param[in,out] data   Easy handle of the transfer.
+ * @param[out]    buf    Buffer to receive data.
+ * @param[in]     len    Size of @p buf in bytes.
+ * @param[out]    pnread Number of bytes read.
+ * @return Result of the next filter, or CURLE_SEND_ERROR (sic) with
+ *         *pnread set to 0 if there is no next filter.
+ */
 CURLcode Curl_cf_def_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
                           char *buf, size_t len, size_t *pnread)
 {
@@ -100,6 +178,13 @@ CURLcode Curl_cf_def_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
   return CURLE_SEND_ERROR;
 }
 
+/**
+ * @brief Default liveness callback: ask the next filter.
+ * @param[in,out] cf            Filter being queried.
+ * @param[in,out] data          Easy handle of the transfer.
+ * @param[out]    input_pending Set by the filter that answers.
+ * @return The next filter's answer; FALSE (pessimistic) if there is none.
+ */
 bool Curl_cf_def_conn_is_alive(struct Curl_cfilter *cf,
                                struct Curl_easy *data,
                                bool *input_pending)
@@ -109,6 +194,12 @@ bool Curl_cf_def_conn_is_alive(struct Curl_cfilter *cf,
     FALSE; /* pessimistic in absence of data */
 }
 
+/**
+ * @brief Default keep-alive callback: forward to the next filter.
+ * @param[in,out] cf   Filter being used.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return Result of the next filter, CURLE_OK if there is none.
+ */
 CURLcode Curl_cf_def_conn_keep_alive(struct Curl_cfilter *cf,
                                      struct Curl_easy *data)
 {
@@ -117,6 +208,16 @@ CURLcode Curl_cf_def_conn_keep_alive(struct Curl_cfilter *cf,
     CURLE_OK;
 }
 
+/**
+ * @brief Default query callback: forward the query to the next filter.
+ * @param[in,out] cf    Filter being queried.
+ * @param[in,out] data  Easy handle of the transfer.
+ * @param[in]     query One of the CF_QUERY_* identifiers.
+ * @param[out]    pres1 Integer result, meaning depends on @p query.
+ * @param[out]    pres2 Pointer result, meaning depends on @p query.
+ * @return Result of the next filter, or CURLE_UNKNOWN_OPTION if no filter
+ *         in the chain answers the query.
+ */
 CURLcode Curl_cf_def_query(struct Curl_cfilter *cf,
                            struct Curl_easy *data,
                            int query, int *pres1, void *pres2)
@@ -127,6 +228,17 @@ CURLcode Curl_cf_def_query(struct Curl_cfilter *cf,
 }
 
 #ifdef CURLVERBOSE
+/**
+ * @brief Trace the filter chain of a connection (verbose builds only).
+ *
+ * Writes a line such as "info [0][TCPv4][TLS]" to the trace; filters
+ * that are not yet connected are prefixed with '!'. The output is cut with
+ * "..." if it does not fit the internal buffer.
+ *
+ * @param[in] data      Easy handle used for trace settings.
+ * @param[in] sockindex Which chain to print (FIRSTSOCKET/SECONDARYSOCKET).
+ * @param[in] info      Text printed before the chain.
+ */
 void Curl_conn_trc_filters(struct Curl_easy *data,
                            int8_t sockindex, const char *info)
 {
@@ -156,6 +268,18 @@ void Curl_conn_trc_filters(struct Curl_easy *data,
 }
 #endif /* CURLVERBOSE */
 
+/**
+ * @brief Destroy and free a filter and all filters below it.
+ *
+ * Each filter is detached from its sub-chain before its destroy callback
+ * runs, so destroy handlers never touch the rest of the chain.
+ *
+ * @param[in,out] pcf  Pointer to the chain head; set to NULL.
+ * @param[in,out] data Easy handle passed to the destroy callbacks.
+ * @warning Does not unlink the filter from a connection. Use
+ *          Curl_conn_cf_discard() for that.
+ * @post *pcf is NULL and all filters are freed.
+ */
 void Curl_conn_cf_discard_chain(struct Curl_cfilter **pcf,
                                 struct Curl_easy *data)
 {
@@ -176,6 +300,14 @@ void Curl_conn_cf_discard_chain(struct Curl_cfilter **pcf,
   }
 }
 
+/**
+ * @brief Discard the whole filter chain of a connection socket index.
+ * @param[in,out] data      Easy handle passed to the destroy callbacks.
+ * @param[in,out] conn      Connection owning the chain.
+ * @param[in]     sockindex Chain to discard.
+ * @post Connect and shutdown start times are reset to -1 and the chain is
+ *       empty.
+ */
 void Curl_conn_cf_discard_all(struct Curl_easy *data,
                               struct connectdata *conn, int8_t sockindex)
 {
@@ -184,6 +316,17 @@ void Curl_conn_cf_discard_all(struct Curl_easy *data,
   Curl_conn_cf_discard_chain(&conn->cfilter[sockindex], data);
 }
 
+/**
+ * @brief Receive data via the first connected filter of a chain.
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Chain to use.
+ * @param[out]    buf       Buffer to receive data.
+ * @param[in]     len       Size of @p buf in bytes.
+ * @param[out]    pnread    Number of bytes read.
+ * @return The result of the filter's receive callback, or
+ *         CURLE_FAILED_INIT (with *pnread 0) if no filter is connected.
+ * @note Skips unconnected filters at the top of the chain.
+ */
 CURLcode Curl_cf_recv(struct Curl_easy *data, int8_t sockindex, char *buf,
                       size_t len, size_t *pnread)
 {
@@ -202,6 +345,17 @@ CURLcode Curl_cf_recv(struct Curl_easy *data, int8_t sockindex, char *buf,
   return CURLE_FAILED_INIT;
 }
 
+/**
+ * @brief Send data via the first connected filter of a chain.
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Chain to use.
+ * @param[in]     buf       Data to send.
+ * @param[in]     len       Number of bytes in @p buf.
+ * @param[in]     eos       TRUE if this is the end of the stream.
+ * @param[out]    pnwritten Number of bytes accepted.
+ * @return The result of the filter's send callback, or
+ *         CURLE_FAILED_INIT (with *pnwritten 0) if no filter is connected.
+ */
 CURLcode Curl_cf_send(struct Curl_easy *data, int8_t sockindex,
                       const uint8_t *buf, size_t len, bool eos,
                       size_t *pnwritten)
@@ -222,11 +376,27 @@ CURLcode Curl_cf_send(struct Curl_easy *data, int8_t sockindex,
   return CURLE_FAILED_INIT;
 }
 
+/**
+ * @brief Context passed to the bufq reader/writer callbacks.
+ * @internal
+ *
+ * Holds the transfer (data) and the filter (cf) through which buffered
+ * I/O is performed.
+ */
 struct cf_io_ctx {
   struct Curl_easy *data;
   struct Curl_cfilter *cf;
 };
 
+/**
+ * @brief bufq reader callback: receive from a filter into the queue.
+ * @internal
+ * @param[in]  writer_ctx Pointer to a struct cf_io_ctx.
+ * @param[out] buf        Destination buffer provided by the bufq.
+ * @param[in]  blen       Size of @p buf.
+ * @param[out] pnread     Number of bytes read.
+ * @return Result of Curl_conn_cf_recv().
+ */
 static CURLcode cf_bufq_reader(void *writer_ctx,
                                unsigned char *buf, size_t blen,
                                size_t *pnread)
@@ -235,6 +405,17 @@ static CURLcode cf_bufq_reader(void *writer_ctx,
   return Curl_conn_cf_recv(io->cf, io->data, (char *)buf, blen, pnread);
 }
 
+/**
+ * @brief Fill a buffer queue with data read from a filter.
+ * @param[in,out] cf     Filter to read from.
+ * @param[in,out] data   Easy handle of the transfer.
+ * @param[in,out] bufq   Queue receiving the data.
+ * @param[in]     maxlen Maximum number of bytes to read (0 for no limit).
+ * @param[out]    pnread Number of bytes added to @p bufq.
+ * @return CURLE_OK on success, CURLE_BAD_FUNCTION_ARGUMENT if @p cf or
+ *         @p data is NULL, otherwise the error from the filter or bufq
+ *         (e.g. CURLE_AGAIN when nothing can be read now).
+ */
 CURLcode Curl_cf_recv_bufq(struct Curl_cfilter *cf,
                            struct Curl_easy *data,
                            struct bufq *bufq,
@@ -252,6 +433,15 @@ CURLcode Curl_cf_recv_bufq(struct Curl_cfilter *cf,
   return Curl_bufq_sipn(bufq, maxlen, cf_bufq_reader, &io, pnread);
 }
 
+/**
+ * @brief bufq writer callback: send queue data through a filter.
+ * @internal
+ * @param[in]  writer_ctx Pointer to a struct cf_io_ctx.
+ * @param[in]  buf        Data provided by the bufq.
+ * @param[in]  buflen     Number of bytes in @p buf.
+ * @param[out] pnwritten  Number of bytes sent.
+ * @return Result of Curl_conn_cf_send() (never signals end of stream).
+ */
 static CURLcode cf_bufq_writer(void *writer_ctx,
                                const uint8_t *buf, size_t buflen,
                                size_t *pnwritten)
@@ -260,6 +450,22 @@ static CURLcode cf_bufq_writer(void *writer_ctx,
   return Curl_conn_cf_send(io->cf, io->data, buf, buflen, FALSE, pnwritten);
 }
 
+/**
+ * @brief Send data from a buffer queue, optionally adding new data first.
+ *
+ * If @p buf and @p blen are given, they are appended to the queue and the
+ * queue is flushed as far as possible; otherwise only the queue content
+ * is passed to the filter.
+ *
+ * @param[in,out] cf        Filter to send through.
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in,out] bufq      Queue holding pending output.
+ * @param[in]     buf       New data to write, may be NULL.
+ * @param[in]     blen      Length of @p buf.
+ * @param[out]    pnwritten Number of bytes of @p buf that were accepted.
+ * @return CURLE_OK on success, CURLE_BAD_FUNCTION_ARGUMENT if @p cf or
+ *         @p data is NULL, otherwise the error from the filter or bufq.
+ */
 CURLcode Curl_cf_send_bufq(struct Curl_cfilter *cf,
                            struct Curl_easy *data,
                            struct bufq *bufq,
@@ -281,6 +487,16 @@ CURLcode Curl_cf_send_bufq(struct Curl_cfilter *cf,
     return Curl_bufq_pass(bufq, cf_bufq_writer, &io, pnwritten);
 }
 
+/**
+ * @brief Allocate a new filter instance.
+ * @param[out] pcf Receives the new filter (NULL on failure).
+ * @param[in]  cft Filter type with its callbacks, must not be NULL.
+ * @param[in]  ctx Filter-private context stored in cf->ctx.
+ * @return CURLE_OK on success, CURLE_OUT_OF_MEMORY if allocation failed.
+ * @warning Ownership of @p ctx passes to the filter, which releases it in
+ *          its destroy callback.
+ * @see Curl_conn_cf_add(), Curl_conn_cf_insert_after()
+ */
 CURLcode Curl_cf_create(struct Curl_cfilter **pcf,
                         const struct Curl_cftype *cft,
                         void *ctx)
@@ -301,6 +517,14 @@ out:
   return result;
 }
 
+/**
+ * @brief Push a filter on top of a connection's filter chain.
+ * @param[in,out] data      Easy handle used for tracing.
+ * @param[in,out] conn      Connection to add to.
+ * @param[in]     sockindex Which chain to add to.
+ * @param[in,out] cf        Filter to add; must not be in a chain yet.
+ * @post @p cf is the head of the chain and linked to the old head.
+ */
 void Curl_conn_cf_add(struct Curl_easy *data,
                       struct connectdata *conn,
                       int8_t sockindex,
@@ -317,6 +541,16 @@ void Curl_conn_cf_add(struct Curl_easy *data,
   CURL_TRC_CF(data, cf, "added");
 }
 
+/**
+ * @brief Insert a filter (or sub-chain) behind an existing filter.
+ *
+ * All inserted filters get the connection and socket index of @p cf_at.
+ *
+ * @param[in,out] cf_at  Existing filter in a chain.
+ * @param[in,out] cf_new Filter or chain to insert; must not be attached to
+ *                       a connection yet.
+ * @post The old successor of @p cf_at follows the last new filter.
+ */
 void Curl_conn_cf_insert_after(struct Curl_cfilter *cf_at,
                                struct Curl_cfilter *cf_new)
 {
@@ -337,6 +571,17 @@ void Curl_conn_cf_insert_after(struct Curl_cfilter *cf_at,
   *pnext = tail;
 }
 
+/**
+ * @brief Unlink a filter from its connection and destroy it.
+ *
+ * If the filter is part of a connection chain it is first removed from
+ * that chain; then the filter and everything below it are destroyed.
+ *
+ * @param[in,out] pcf  Pointer to the filter; set to NULL.
+ * @param[in,out] data Easy handle passed to the destroy callbacks.
+ * @return TRUE if the filter was found and unlinked from the chain of its
+ *         connection, FALSE otherwise.
+ */
 bool Curl_conn_cf_discard(struct Curl_cfilter **pcf,
                           struct Curl_easy *data)
 {
@@ -361,6 +606,14 @@ bool Curl_conn_cf_discard(struct Curl_cfilter **pcf,
   return found;
 }
 
+/**
+ * @brief Run the connect step of a filter.
+ * @param[in,out] cf   Filter to connect, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[out]    done Set TRUE when connected.
+ * @return CURLE_OK, an error from the filter, or CURLE_FAILED_INIT if
+ *         @p cf is NULL.
+ */
 CURLcode Curl_conn_cf_connect(struct Curl_cfilter *cf,
                               struct Curl_easy *data,
                               bool *done)
@@ -370,6 +623,17 @@ CURLcode Curl_conn_cf_connect(struct Curl_cfilter *cf,
   return CURLE_FAILED_INIT;
 }
 
+/**
+ * @brief Send data through a specific filter.
+ * @param[in,out] cf        Filter to use, may be NULL.
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in]     buf       Data to send.
+ * @param[in]     len       Number of bytes in @p buf.
+ * @param[in]     eos       TRUE if this is the end of the stream.
+ * @param[out]    pnwritten Number of bytes accepted.
+ * @return The filter's result, or CURLE_SEND_ERROR (with *pnwritten 0)
+ *         if @p cf is NULL.
+ */
 CURLcode Curl_conn_cf_send(struct Curl_cfilter *cf, struct Curl_easy *data,
                            const uint8_t *buf, size_t len, bool eos,
                            size_t *pnwritten)
@@ -380,6 +644,16 @@ CURLcode Curl_conn_cf_send(struct Curl_cfilter *cf, struct Curl_easy *data,
   return CURLE_SEND_ERROR;
 }
 
+/**
+ * @brief Receive data through a specific filter.
+ * @param[in,out] cf     Filter to use, may be NULL.
+ * @param[in,out] data   Easy handle of the transfer.
+ * @param[out]    buf    Buffer to receive data.
+ * @param[in]     len    Size of @p buf in bytes.
+ * @param[out]    pnread Number of bytes read.
+ * @return The filter's result, or CURLE_RECV_ERROR (with *pnread 0) if
+ *         @p cf is NULL.
+ */
 CURLcode Curl_conn_cf_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
                            char *buf, size_t len, size_t *pnread)
 {
@@ -389,6 +663,18 @@ CURLcode Curl_conn_cf_recv(struct Curl_cfilter *cf, struct Curl_easy *data,
   return CURLE_RECV_ERROR;
 }
 
+/**
+ * @brief Send a control event to all filter chains of a connection.
+ * @internal
+ * @param[in,out] conn          Connection whose chains are visited.
+ * @param[in,out] data          Easy handle of the transfer.
+ * @param[in]     ignore_result TRUE to continue past filter errors.
+ * @param[in]     event         CF_CTRL_* event.
+ * @param[in]     arg1          Event-specific integer argument.
+ * @param[in,out] arg2          Event-specific pointer argument.
+ * @return CURLE_OK, or the first error if @p ignore_result is FALSE,
+ *         otherwise the result of the last chain visited.
+ */
 static CURLcode cf_cntrl_all(struct connectdata *conn,
                              struct Curl_easy *data,
                              bool ignore_result,
@@ -406,6 +692,13 @@ static CURLcode cf_cntrl_all(struct connectdata *conn,
   return result;
 }
 
+/**
+ * @brief Check if the IP level connection of a filter chain is up.
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return TRUE if the CF_QUERY_REALLY_CONNECTED query succeeded and
+ *         reported connected, FALSE otherwise.
+ */
 bool Curl_conn_cf_is_ip_connected(struct Curl_cfilter *cf,
                                   struct Curl_easy *data)
 {
@@ -417,12 +710,24 @@ bool Curl_conn_cf_is_ip_connected(struct Curl_cfilter *cf,
   return FALSE;
 }
 
+/**
+ * @brief Ask all filters to update the transfer's connection info.
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[in,out] conn Connection to notify.
+ * @note Errors from filters are ignored.
+ */
 void Curl_conn_cntrl_update_info(struct Curl_easy *data,
                                 struct connectdata *conn)
 {
   cf_cntrl_all(conn, data, TRUE, CF_CTRL_CONN_INFO_UPDATE, 0, NULL);
 }
 
+/**
+ * @brief Ask the filters of one chain to report their statistics.
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in,out] conn      Connection to notify.
+ * @param[in]     sockindex Chain index; out of range values are ignored.
+ */
 void Curl_conn_cntrl_report_stats(struct Curl_easy *data,
                                   struct connectdata *conn,
                                   int sockindex)
@@ -432,6 +737,15 @@ void Curl_conn_cntrl_report_stats(struct Curl_easy *data,
                              CF_CTRL_REPORT_STATS, 0, NULL);
 }
 
+/**
+ * @brief Remove connected "setup" filters from a chain.
+ *
+ * Filters of type CF_TYPE_SETUP only drive connection establishment. Once
+ * connected they are unlinked and destroyed.
+ *
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Chain to clean up.
+ */
 void Curl_conn_remove_setup_filters(struct Curl_easy *data,
                                     int8_t sockindex)
 {
@@ -450,6 +764,13 @@ void Curl_conn_remove_setup_filters(struct Curl_easy *data,
   }
 }
 
+/**
+ * @brief Check if a filter chain exists for a socket index.
+ * @param[in] conn      Connection to inspect.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if the chain has at least one filter, FALSE if empty or the
+ *         index is invalid.
+ */
 bool Curl_conn_is_setup(struct connectdata *conn, int8_t sockindex)
 {
   if(!CONN_SOCK_IDX_VALID(sockindex))
@@ -457,6 +778,14 @@ bool Curl_conn_is_setup(struct connectdata *conn, int8_t sockindex)
   return !!conn->cfilter[sockindex];
 }
 
+/**
+ * @brief Check if a connection socket index is fully connected.
+ * @param[in] conn      Connection to inspect.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if the top filter is connected, or if the chain is empty
+ *         and the scheme needs no network (PROTOPT_NONETWORK). FALSE
+ *         otherwise, including for an invalid index.
+ */
 bool Curl_conn_is_connected(struct connectdata *conn, int8_t sockindex)
 {
   struct Curl_cfilter *cf;
@@ -471,6 +800,17 @@ bool Curl_conn_is_connected(struct connectdata *conn, int8_t sockindex)
   return FALSE;
 }
 
+/**
+ * @brief Check if the IP connection (below TLS etc.) is established.
+ *
+ * Walks down the chain from the top: connected filters answer TRUE, the
+ * first filter of type CF_TYPE_IP_CONNECT stops the search with FALSE.
+ *
+ * @param[in] data      Easy handle with an attached connection.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if a connected filter is found above the IP layer filter,
+ *         FALSE otherwise.
+ */
 bool Curl_conn_is_ip_connected(struct Curl_easy *data, int8_t sockindex)
 {
   struct Curl_cfilter *cf;
@@ -489,6 +829,12 @@ bool Curl_conn_is_ip_connected(struct Curl_easy *data, int8_t sockindex)
 }
 
 #ifndef CURL_DISABLE_PROXY
+/**
+ * @brief Check if a chain contains a tunneling proxy filter.
+ * @internal
+ * @param[in] cf Top of the (sub-)chain.
+ * @return TRUE if any filter has CF_TYPE_PROXY set.
+ */
 static bool cf_is_tunneling(struct Curl_cfilter *cf)
 {
   for(; cf; cf = cf->next) {
@@ -498,6 +844,13 @@ static bool cf_is_tunneling(struct Curl_cfilter *cf)
   return FALSE;
 }
 
+/**
+ * @brief Check if the connection is tunneled through a proxy.
+ * @param[in] conn      Connection to inspect, may be NULL.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if a proxy tunnel filter is in the chain, FALSE otherwise
+ *         (also for an invalid index or NULL connection).
+ */
 bool Curl_conn_is_tunneling(struct connectdata *conn, int8_t sockindex)
 {
   if(!CONN_SOCK_IDX_VALID(sockindex))
@@ -505,6 +858,12 @@ bool Curl_conn_is_tunneling(struct connectdata *conn, int8_t sockindex)
   return conn ? cf_is_tunneling(conn->cfilter[sockindex]) : FALSE;
 }
 #else
+/**
+ * @brief Stub when proxy support is disabled: never tunneling.
+ * @param[in] conn      Unused.
+ * @param[in] sockindex Unused.
+ * @return Always FALSE.
+ */
 bool Curl_conn_is_tunneling(struct connectdata *conn, int8_t sockindex)
 {
   (void)conn;
@@ -513,6 +872,18 @@ bool Curl_conn_is_tunneling(struct connectdata *conn, int8_t sockindex)
 }
 #endif /* CURL_DISABLE_PROXY */
 
+/**
+ * @brief Check if a chain provides end-to-end TLS.
+ * @internal
+ *
+ * Scans down to the IP connect filter. A TLS filter that belongs to a
+ * proxy does not count, as a tunneling proxy does not offer end-to-end
+ * encryption even if it uses TLS itself (e.g. QUIC H3 proxy).
+ *
+ * @param[in] cf Top of the chain.
+ * @return TRUE if a non-proxy CF_TYPE_SSL filter is found above the IP
+ *         connect filter, FALSE otherwise.
+ */
 static bool cf_is_ssl(struct Curl_cfilter *cf)
 {
   for(; cf; cf = cf->next) {
@@ -526,6 +897,12 @@ static bool cf_is_ssl(struct Curl_cfilter *cf)
   return FALSE;
 }
 
+/**
+ * @brief Check if a connection uses end-to-end TLS.
+ * @param[in] conn      Connection to inspect, may be NULL.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if the chain is TLS protected, FALSE otherwise.
+ */
 bool Curl_conn_is_ssl(struct connectdata *conn, int8_t sockindex)
 {
   if(!CONN_SOCK_IDX_VALID(sockindex))
@@ -533,6 +910,16 @@ bool Curl_conn_is_ssl(struct connectdata *conn, int8_t sockindex)
   return conn ? cf_is_ssl(conn->cfilter[sockindex]) : FALSE;
 }
 
+/**
+ * @brief Query TLS session information from the filter chain.
+ * @param[in]  data      Easy handle of the transfer.
+ * @param[in]  conn      Connection to inspect.
+ * @param[in]  sockindex Chain index.
+ * @param[in]  query     Query identifier passed to the filter.
+ * @param[out] info      Receives the TLS session info.
+ * @return TRUE if the connection uses TLS and the filter answered the
+ *         query, FALSE otherwise.
+ */
 bool Curl_conn_get_ssl_info(struct Curl_easy *data,
                             struct connectdata *conn, int8_t sockindex,
                             int query,
@@ -550,6 +937,17 @@ bool Curl_conn_get_ssl_info(struct Curl_easy *data,
   return FALSE;
 }
 
+/**
+ * @brief Get IP address information of a connection.
+ * @param[in]  data      Easy handle of the transfer.
+ * @param[in]  conn      Connection to inspect, may be NULL.
+ * @param[in]  sockindex Chain index.
+ * @param[out] is_ipv6   TRUE if the connection uses IPv6.
+ * @param[out] ipquad    Local/remote address and port.
+ * @return CURLE_OK on success, CURLE_BAD_FUNCTION_ARGUMENT for an invalid
+ *         index, CURLE_UNKNOWN_OPTION if no filter answers.
+ * @see Curl_conn_cf_get_ip_info()
+ */
 CURLcode Curl_conn_get_ip_info(struct Curl_easy *data,
                                struct connectdata *conn, int8_t sockindex,
                                bool *is_ipv6, struct ip_quadruple *ipquad)
@@ -561,6 +959,13 @@ CURLcode Curl_conn_get_ip_info(struct Curl_easy *data,
   return Curl_conn_cf_get_ip_info(cf, data, is_ipv6, ipquad);
 }
 
+/**
+ * @brief Check if the connection can multiplex transfers.
+ * @param[in] conn      Connection to inspect, may be NULL.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if a CF_TYPE_MULTIPLEX filter is found above the IP and
+ *         TLS filters, FALSE otherwise.
+ */
 bool Curl_conn_is_multiplex(struct connectdata *conn, int8_t sockindex)
 {
   struct Curl_cfilter *cf;
@@ -576,6 +981,13 @@ bool Curl_conn_is_multiplex(struct connectdata *conn, int8_t sockindex)
   return FALSE;
 }
 
+/**
+ * @brief Get the transport (TCP, UDP, QUIC, UNIX) of a connection.
+ * @param[in] data Easy handle of the transfer.
+ * @param[in] conn Connection to inspect.
+ * @return One of the TRNSPRT_* values from the first socket's chain.
+ * @see Curl_conn_cf_get_transport()
+ */
 unsigned char Curl_conn_get_transport(struct Curl_easy *data,
                                       struct connectdata *conn)
 {
@@ -583,6 +995,11 @@ unsigned char Curl_conn_get_transport(struct Curl_easy *data,
   return Curl_conn_cf_get_transport(cf, data);
 }
 
+/**
+ * @brief Map a transport to a socket type.
+ * @param[in] transport TRNSPRT_* value.
+ * @return SOCK_STREAM for TCP and UNIX, SOCK_DGRAM otherwise.
+ */
 int Curl_socktype_for_transport(uint8_t transport)
 {
   switch(transport) {
@@ -595,6 +1012,11 @@ int Curl_socktype_for_transport(uint8_t transport)
   }
 }
 
+/**
+ * @brief Map a transport to an IP protocol number.
+ * @param[in] transport TRNSPRT_* value.
+ * @return IPPROTO_TCP for TCP, IPPROTO_IP for UNIX, IPPROTO_UDP otherwise.
+ */
 int Curl_protocol_for_transport(uint8_t transport)
 {
   switch(transport) {
@@ -607,6 +1029,17 @@ int Curl_protocol_for_transport(uint8_t transport)
   }
 }
 
+/**
+ * @brief Determine the HTTP version negotiated on a filter chain.
+ *
+ * Looks for a CF_TYPE_HTTP filter above the IP connect and TLS filters
+ * and queries it with CF_QUERY_HTTP_VERSION.
+ *
+ * @param[in] data Easy handle of the transfer.
+ * @param[in] cf   Top of the chain to inspect.
+ * @return The version as reported by the filter, or 0 if unknown, the
+ *         query failed or the value is out of range.
+ */
 uint8_t Curl_conn_cf_http_version(struct Curl_easy *data,
                                   struct Curl_cfilter *cf)
 {
@@ -629,12 +1062,26 @@ uint8_t Curl_conn_cf_http_version(struct Curl_easy *data,
   return (uint8_t)(result ? 0 : v);
 }
 
+/**
+ * @brief Determine the HTTP version used on the first socket.
+ * @param[in] data Easy handle of the transfer.
+ * @param[in] conn Connection to inspect.
+ * @return HTTP version, 0 if unknown.
+ * @see Curl_conn_cf_http_version()
+ */
 uint8_t Curl_conn_http_version(struct Curl_easy *data,
                                struct connectdata *conn)
 {
   return Curl_conn_cf_http_version(data, conn->cfilter[FIRSTSOCKET]);
 }
 
+/**
+ * @brief Check if buffered data can be read without further socket I/O.
+ * @param[in] data      Easy handle with an attached connection.
+ * @param[in] sockindex Chain index.
+ * @return TRUE if the first connected filter reports pending data, FALSE
+ *         otherwise.
+ */
 bool Curl_conn_data_pending(struct Curl_easy *data, int8_t sockindex)
 {
   struct Curl_cfilter *cf;
@@ -655,6 +1102,13 @@ bool Curl_conn_data_pending(struct Curl_easy *data, int8_t sockindex)
   return FALSE;
 }
 
+/**
+ * @brief Check if a filter chain has output that still needs flushing.
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return TRUE if CF_QUERY_NEED_FLUSH succeeded and reported pending
+ *         output, FALSE otherwise.
+ */
 bool Curl_conn_cf_needs_flush(struct Curl_cfilter *cf,
                               struct Curl_easy *data)
 {
@@ -665,6 +1119,12 @@ bool Curl_conn_cf_needs_flush(struct Curl_cfilter *cf,
   return (result || !pending) ? FALSE : TRUE;
 }
 
+/**
+ * @brief Check if the chain of a socket index needs flushing.
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Chain index.
+ * @return TRUE if output is pending, FALSE if not or on invalid index.
+ */
 bool Curl_conn_needs_flush(struct Curl_easy *data, int8_t sockindex)
 {
   if(!CONN_SOCK_IDX_VALID(sockindex))
@@ -672,6 +1132,14 @@ bool Curl_conn_needs_flush(struct Curl_easy *data, int8_t sockindex)
   return Curl_conn_cf_needs_flush(data->conn->cfilter[sockindex], data);
 }
 
+/**
+ * @brief Let the filters of a chain add their sockets to a pollset.
+ * @param[in,out] cf   Top of the chain.
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[in,out] ps   Pollset to adjust.
+ * @return CURLE_OK, or the first error from a filter's adjust_pollset.
+ * @note Filters in shutdown are skipped.
+ */
 CURLcode Curl_conn_cf_adjust_pollset(struct Curl_cfilter *cf,
                                      struct Curl_easy *data,
                                      struct easy_pollset *ps)
@@ -692,6 +1160,16 @@ CURLcode Curl_conn_cf_adjust_pollset(struct Curl_cfilter *cf,
   return result;
 }
 
+/**
+ * @brief Let the connection's filter chains update the transfer pollset.
+ *
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[in,out] conn Connection whose chains are visited.
+ * @param[in,out] ps   Pollset to adjust.
+ * @return CURLE_OK or the first error from a chain.
+ * @note A chain is only consulted if the transfer wants I/O, the chain is
+ *       not connected yet or it is in shutdown (see inline comment).
+ */
 CURLcode Curl_conn_adjust_pollset(struct Curl_easy *data,
                                   struct connectdata *conn,
                                   struct easy_pollset *ps)
@@ -724,11 +1202,13 @@ CURLcode Curl_conn_adjust_pollset(struct Curl_easy *data,
   return result;
 }
 
-/*
- * Return values:
- *   -1 = error
- *    0 = timeout
- *    N = number of structures with non zero revent fields
+/**
+ * @brief Poll the sockets a filter chain is interested in.
+ * @param[in,out] cf         Top of the chain, must not be NULL.
+ * @param[in,out] data       Easy handle with an attached connection.
+ * @param[in]     timeout_ms Maximum time to wait in milliseconds.
+ * @return -1 on error, 0 on timeout, otherwise the number of structures
+ *         with non zero revent fields.
  */
 int Curl_conn_cf_poll(struct Curl_cfilter *cf,
                       struct Curl_easy *data,
@@ -752,6 +1232,19 @@ int Curl_conn_cf_poll(struct Curl_cfilter *cf,
   return rc;
 }
 
+/**
+ * @brief Get the host and port currently being talked to.
+ *
+ * While a tunneling proxy filter has not connected yet, the interim host
+ * is the proxy; otherwise it is the destination of the connection.
+ *
+ * @param[in]  data      Easy handle of the transfer.
+ * @param[in]  sockindex Chain index.
+ * @param[out] phost     Receives the hostname (not owned by caller).
+ * @param[out] pport     Receives the port, may be NULL.
+ * @warning The returned string points into connection or filter data and
+ *          is only valid as long as those live.
+ */
 void Curl_conn_get_current_host(struct Curl_easy *data, int8_t sockindex,
                                 const char **phost, int *pport)
 {
@@ -788,6 +1281,15 @@ void Curl_conn_get_current_host(struct Curl_easy *data, int8_t sockindex,
     *pport = portarg;
 }
 
+/**
+ * @brief Default control callback: ignore the event.
+ * @param[in,out] cf    Filter (unused).
+ * @param[in,out] data  Easy handle (unused).
+ * @param[in]     event CF_CTRL_* event (unused).
+ * @param[in]     arg1  Event argument (unused).
+ * @param[in,out] arg2  Event argument (unused).
+ * @return Always CURLE_OK.
+ */
 CURLcode Curl_cf_def_cntrl(struct Curl_cfilter *cf,
                            struct Curl_easy *data,
                            int event, int arg1, void *arg2)
@@ -800,6 +1302,20 @@ CURLcode Curl_cf_def_cntrl(struct Curl_cfilter *cf,
   return CURLE_OK;
 }
 
+/**
+ * @brief Send a control event to a filter and all filters below it.
+ *
+ * Filters that use the default control handler are skipped.
+ *
+ * @param[in,out] cf            Top of the chain, may be NULL.
+ * @param[in,out] data          Easy handle of the transfer.
+ * @param[in]     ignore_result TRUE to continue past errors.
+ * @param[in]     event         CF_CTRL_* event.
+ * @param[in]     arg1          Event-specific integer argument.
+ * @param[in,out] arg2          Event-specific pointer argument.
+ * @return CURLE_OK, or the first error if @p ignore_result is FALSE,
+ *         otherwise the result of the last handler.
+ */
 CURLcode Curl_conn_cf_cntrl(struct Curl_cfilter *cf,
                             struct Curl_easy *data,
                             bool ignore_result,
@@ -817,6 +1333,12 @@ CURLcode Curl_conn_cf_cntrl(struct Curl_cfilter *cf,
   return result;
 }
 
+/**
+ * @brief Get the socket of a filter chain.
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return The socket, or CURL_SOCKET_BAD if the query fails.
+ */
 curl_socket_t Curl_conn_cf_get_socket(struct Curl_cfilter *cf,
                                       struct Curl_easy *data)
 {
@@ -826,6 +1348,13 @@ curl_socket_t Curl_conn_cf_get_socket(struct Curl_cfilter *cf,
   return CURL_SOCKET_BAD;
 }
 
+/**
+ * @brief Get the transport used by a filter chain.
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return The TRNSPRT_* value reported by the chain, otherwise the
+ *         transport wanted by the connection (0 if no connection).
+ */
 unsigned char Curl_conn_cf_get_transport(struct Curl_cfilter *cf,
                                          struct Curl_easy *data)
 {
@@ -835,6 +1364,13 @@ unsigned char Curl_conn_cf_get_transport(struct Curl_cfilter *cf,
   return (unsigned char)(data->conn ? data->conn->transport_wanted : 0);
 }
 
+/**
+ * @brief Get the ALPN protocol negotiated on a filter chain.
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return The ALPN identifier, or NULL if none was negotiated.
+ * @warning The string is owned by the filter; do not free it.
+ */
 const char *Curl_conn_cf_get_alpn_negotiated(struct Curl_cfilter *cf,
                                              struct Curl_easy *data)
 {
@@ -846,6 +1382,14 @@ const char *Curl_conn_cf_get_alpn_negotiated(struct Curl_cfilter *cf,
   return NULL;
 }
 
+/**
+ * @brief Query the remote address of a filter chain.
+ * @internal
+ * @param[in,out] cf   Filter to ask, may be NULL.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return The remote address, or NULL if the query failed.
+ * @warning The address is owned by the filter chain.
+ */
 static const struct Curl_sockaddr_ex *cf_get_remote_addr(
   struct Curl_cfilter *cf, struct Curl_easy *data)
 {
@@ -857,6 +1401,15 @@ static const struct Curl_sockaddr_ex *cf_get_remote_addr(
   return NULL;
 }
 
+/**
+ * @brief Get IP address information from a filter chain.
+ * @param[in,out] cf      Filter to ask, may be NULL.
+ * @param[in,out] data    Easy handle of the transfer.
+ * @param[out]    is_ipv6 TRUE if IPv6 is used (only set if @p cf given).
+ * @param[out]    ipquad  Receives the address quadruple.
+ * @return CURLE_OK on success, CURLE_UNKNOWN_OPTION if @p cf is NULL or
+ *         does not answer.
+ */
 CURLcode Curl_conn_cf_get_ip_info(struct Curl_cfilter *cf,
                                   struct Curl_easy *data,
                                   bool *is_ipv6, struct ip_quadruple *ipquad)
@@ -870,6 +1423,13 @@ CURLcode Curl_conn_cf_get_ip_info(struct Curl_cfilter *cf,
   return result;
 }
 
+/**
+ * @brief Get the primary socket of the connection.
+ * @param[in] data Easy handle of the transfer.
+ * @return The socket, or CURL_SOCKET_BAD if there is no connection.
+ * @note If the top filter is not connected yet, the chain is queried,
+ *       otherwise conn->sock[FIRSTSOCKET] is used.
+ */
 curl_socket_t Curl_conn_get_first_socket(struct Curl_easy *data)
 {
   struct Curl_cfilter *cf;
@@ -885,6 +1445,13 @@ curl_socket_t Curl_conn_get_first_socket(struct Curl_easy *data)
   return data->conn->sock[FIRSTSOCKET];
 }
 
+/**
+ * @brief Get the remote address of a connection socket index.
+ * @param[in] data      Easy handle of the transfer.
+ * @param[in] sockindex Chain index.
+ * @return The remote address, or NULL if unavailable.
+ * @warning The address is owned by the filter chain.
+ */
 const struct Curl_sockaddr_ex *Curl_conn_get_remote_addr(
   struct Curl_easy *data, int8_t sockindex)
 {
@@ -894,11 +1461,23 @@ const struct Curl_sockaddr_ex *Curl_conn_get_remote_addr(
   return cf ? cf_get_remote_addr(cf, data) : NULL;
 }
 
+/**
+ * @brief Notify filters that a transfer is set up on the connection.
+ * @param[in,out] data Easy handle of the transfer.
+ * @return CURLE_OK or the first error from a filter.
+ */
 CURLcode Curl_conn_ev_data_setup(struct Curl_easy *data)
 {
   return cf_cntrl_all(data->conn, data, FALSE, CF_CTRL_DATA_SETUP, 0, NULL);
 }
 
+/**
+ * @brief Ask the filters of a socket index to flush pending output.
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Chain index.
+ * @return CURLE_OK, CURLE_AGAIN style results from filters, or
+ *         CURLE_BAD_FUNCTION_ARGUMENT for an invalid index.
+ */
 CURLcode Curl_conn_flush(struct Curl_easy *data, int8_t sockindex)
 {
   if(!CONN_SOCK_IDX_VALID(sockindex))
@@ -908,8 +1487,12 @@ CURLcode Curl_conn_flush(struct Curl_easy *data, int8_t sockindex)
 }
 
 /**
- * Notify connection filters that the transfer represented by `data`
- * is done with sending data (e.g. has uploaded everything).
+ * @brief Notify filters that the transfer is done sending data.
+ *
+ * For example when it has uploaded everything.
+ *
+ * @param[in,out] data Easy handle of the transfer.
+ * @note Errors from filters are ignored.
  */
 void Curl_conn_ev_data_done_send(struct Curl_easy *data)
 {
@@ -917,20 +1500,39 @@ void Curl_conn_ev_data_done_send(struct Curl_easy *data)
 }
 
 /**
- * Notify connection filters that the transfer represented by `data`
- * is finished - eventually premature, e.g. before being complete.
+ * @brief Notify filters that the transfer is finished.
+ *
+ * The transfer may end prematurely, e.g. before being complete.
+ *
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in]     premature TRUE if the transfer ended before completion.
+ * @note Errors from filters are ignored.
  */
 void Curl_conn_ev_data_done(struct Curl_easy *data, bool premature)
 {
   cf_cntrl_all(data->conn, data, TRUE, CF_CTRL_DATA_DONE, premature, NULL);
 }
 
+/**
+ * @brief Notify filters that the transfer is paused or unpaused.
+ * @param[in,out] data     Easy handle of the transfer.
+ * @param[in]     do_pause TRUE to pause, FALSE to resume.
+ * @return CURLE_OK or the first error from a filter.
+ */
 CURLcode Curl_conn_ev_data_pause(struct Curl_easy *data, bool do_pause)
 {
   return cf_cntrl_all(data->conn, data, FALSE,
                       CF_CTRL_DATA_PAUSE, do_pause, NULL);
 }
 
+/**
+ * @brief Check if the first socket's connection is still usable.
+ * @param[in,out] data          Easy handle of the transfer.
+ * @param[in,out] conn          Connection to check.
+ * @param[out]    input_pending Set if unread input is waiting.
+ * @return TRUE if a filter exists, the connection is not marked for close
+ *         and the filter reports it alive; FALSE otherwise.
+ */
 bool Curl_conn_is_alive(struct Curl_easy *data, struct connectdata *conn,
                         bool *input_pending)
 {
@@ -939,6 +1541,12 @@ bool Curl_conn_is_alive(struct Curl_easy *data, struct connectdata *conn,
          cf->cft->is_alive(cf, data, input_pending);
 }
 
+/**
+ * @brief Send keep-alive signals on all chains of a connection.
+ * @param[in,out] data Easy handle of the transfer.
+ * @param[in,out] conn Connection to use.
+ * @return CURLE_OK, or the first error from a filter.
+ */
 CURLcode Curl_conn_keep_alive(struct Curl_easy *data,
                               struct connectdata *conn)
 {
@@ -953,6 +1561,15 @@ CURLcode Curl_conn_keep_alive(struct Curl_easy *data,
   return result;
 }
 
+/**
+ * @brief Get how many transfers the connection can run in parallel.
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in,out] conn      Connection to query.
+ * @param[in]     sockindex Chain index.
+ * @return The limit; 1 for non-multiplexed connections or if no filter
+ *         answers, 0 for an invalid index. May be 0 for connections in
+ *         shutdown, e.g. after a server HTTP/2 GOAWAY.
+ */
 size_t Curl_conn_get_max_concurrent(struct Curl_easy *data,
                                     struct connectdata *conn,
                                     int8_t sockindex)
@@ -973,6 +1590,14 @@ size_t Curl_conn_get_max_concurrent(struct Curl_easy *data,
   return (result || n < 0) ? 1 : (size_t)n;
 }
 
+/**
+ * @brief Get the stream error code of a connection, if any.
+ * @param[in,out] data      Easy handle of the transfer.
+ * @param[in,out] conn      Connection to query.
+ * @param[in]     sockindex Chain index.
+ * @return The protocol specific error code, 0 if none, unknown or on an
+ *         invalid index.
+ */
 int Curl_conn_get_stream_error(struct Curl_easy *data,
                                struct connectdata *conn,
                                int8_t sockindex)
@@ -990,6 +1615,13 @@ int Curl_conn_get_stream_error(struct Curl_easy *data,
   return (result || n < 0) ? 0 : n;
 }
 
+/**
+ * @brief Map a socket descriptor to its connection socket index.
+ * @param[in] data   Easy handle of the transfer, may be NULL.
+ * @param[in] sockfd Socket descriptor.
+ * @return SECONDARYSOCKET if @p sockfd is the connection's secondary
+ *         socket, FIRSTSOCKET otherwise.
+ */
 int8_t Curl_conn_sockindex(struct Curl_easy *data, curl_socket_t sockfd)
 {
   if(data && data->conn &&
@@ -998,6 +1630,16 @@ int8_t Curl_conn_sockindex(struct Curl_easy *data, curl_socket_t sockfd)
   return FIRSTSOCKET;
 }
 
+/**
+ * @brief Receive data on a connection via its recv function.
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Socket index.
+ * @param[out]    buf       Buffer to receive data.
+ * @param[in]     len       Size of @p buf.
+ * @param[out]    pnread    Number of bytes read.
+ * @return The recv function's result, CURLE_BAD_FUNCTION_ARGUMENT for an
+ *         invalid index, CURLE_FAILED_INIT if no recv function is set.
+ */
 CURLcode Curl_conn_recv(struct Curl_easy *data, int8_t sockindex,
                         char *buf, size_t len, size_t *pnread)
 {
@@ -1011,6 +1653,23 @@ CURLcode Curl_conn_recv(struct Curl_easy *data, int8_t sockindex,
   return CURLE_FAILED_INIT;
 }
 
+/**
+ * @brief Send data on a connection via its send function.
+ *
+ * In debug builds, the CURL_SMALLSENDS environment variable limits the
+ * number of bytes sent per call to force short writes.
+ *
+ * @param[in,out] data      Easy handle with an attached connection.
+ * @param[in]     sockindex Socket index.
+ * @param[in]     buf       Data to send.
+ * @param[in]     len       Number of bytes in @p buf.
+ * @param[in]     eos       TRUE if this is the end of the stream.
+ * @param[out]    pnwritten Number of bytes accepted.
+ * @return The send function's result, CURLE_BAD_FUNCTION_ARGUMENT for an
+ *         invalid index, CURLE_SEND_ERROR if more bytes were reported
+ *         than offered, CURLE_FAILED_INIT if no send function is set.
+ * @note When a short send is forced, @p eos is reset to FALSE.
+ */
 CURLcode Curl_conn_send(struct Curl_easy *data, int8_t sockindex,
                         const void *buf, size_t len, bool eos,
                         size_t *pnwritten)

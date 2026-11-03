@@ -21,6 +21,21 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+
+/**
+ * @file
+ * @brief Core of the curl tool: sets up and runs all transfers.
+ *
+ * This file implements operate(), which parses .curlrc and the command line,
+ * creates the share object, builds one libcurl easy handle per URL (including
+ * URL globbing, upload files, output files, ETag files and retries) and drives
+ * them either serially or in parallel through the multi interface.
+ *
+ * @note Transfers are tracked in a doubly linked list of per_transfer nodes.
+ * @warning The list and the global state are not protected by locks; the tool
+ *          uses them from a single thread only.
+ * @see tool_main.c, tool_cfgable.h, tool_getparam.c
+ */
 #include "tool_setup.h"
 
 #include "curlx/nonblock.h" /* for curlx_nonblock() */
@@ -88,6 +103,12 @@
 CURL_EXTERN CURLcode curl_easy_perform_ev(CURL *easy);
 #endif
 
+/**
+ * @brief Hint printed after a certificate verification failure.
+ *
+ * Points the user to the curl documentation about SSL CA certificates.
+ * Used when a transfer fails with a peer verification error.
+ */
 #define CURL_CA_CERT_ERRORMSG                                              \
   "More details here: https://curl.se/docs/sslcerts.html\n\n"              \
   "curl failed to verify the legitimacy of the server and therefore "      \
@@ -95,10 +116,26 @@ CURL_EXTERN CURLcode curl_easy_perform_ev(CURL *easy);
   "this situation and\nhow to fix it, please visit the webpage mentioned " \
   "above.\n"
 
+/**
+ * @brief Forward declaration of create_transfer().
+ * @see create_transfer()
+ */
 static CURLcode create_transfer(CURLSH *share,
                                 bool *added,
                                 bool *skipped);
 
+/**
+ * @internal
+ * @brief Tell whether a libcurl result code must abort all transfers.
+ *
+ * A fatal error is one that points at a broken setup or resource
+ * exhaustion rather than at a single failed transfer.
+ *
+ * @param[in] code Result code of a finished transfer.
+ * @return TRUE for CURLE_FAILED_INIT, CURLE_OUT_OF_MEMORY,
+ *         CURLE_UNKNOWN_OPTION and CURLE_BAD_FUNCTION_ARGUMENT;
+ *         FALSE for any other value, including CURLE_OK.
+ */
 static bool is_fatal_error(CURLcode code)
 {
   switch(code) {
@@ -116,8 +153,14 @@ static bool is_fatal_error(CURLcode code)
   return FALSE;
 }
 
-/*
- * Check if a given string is a PKCS#11 URI
+/**
+ * @internal
+ * @brief Check if a given string is a PKCS#11 URI.
+ *
+ * The match is case-insensitive and only looks at the "pkcs11:" prefix.
+ *
+ * @param[in] string NUL-terminated string to test, must not be NULL.
+ * @return TRUE if the string starts with "pkcs11:", otherwise FALSE.
  */
 static bool is_pkcs11_uri(const char *string)
 {
@@ -130,15 +173,20 @@ static bool is_pkcs11_uri(const char *string)
 }
 
 #ifdef __VMS
-/*
- * get_vms_file_size does what it takes to get the real size of the file
+/**
+ * @internal
+ * @brief Get the real size of a file on VMS (VMS only).
  *
  * For fixed files, find out the size of the EOF block and adjust.
+ * For all others the entire file has to be read in, discarding the
+ * contents. Most posted text files are small, and binary files like zlib
+ * archives and CD/DVD images should be either a STREAM_LF format or a
+ * fixed format.
  *
- * For all others, have to read the entire file in, discarding the contents.
- * Most posted text files are small, and binary files like zlib archives
- * and CD/DVD images should be either a STREAM_LF format or a fixed format.
- *
+ * @param[in] name     Path of the file to measure.
+ * @param[in] stat_buf  Result of stat() for @p name (currently unused).
+ * @return Number of bytes in the file, or 0 if it cannot be opened.
+ * @note Reading the file is O(n) in the file size.
  */
 static curl_off_t vms_realfilesize(const char *name,
                                    const curlx_struct_stat *stat_buf)
@@ -165,11 +213,17 @@ static curl_off_t vms_realfilesize(const char *name,
   return count;
 }
 
-/*
+/**
+ * @internal
+ * @brief Check if st_size can be trusted and fix it if not (VMS only).
  *
- *  VmsSpecialSize checks to see if the stat st_size can be trusted and
- *  if not to call a routine to get the correct size.
+ * Variable-length record formats (FAB$C_VAR, FAB$C_VFC) report a size that
+ * does not match the byte count, so vms_realfilesize() is used for them.
  *
+ * @param[in] name     Path of the file.
+ * @param[in] stat_buf  Result of stat() for @p name.
+ * @return The size in bytes of the file as it will be read.
+ * @see vms_realfilesize()
  */
 static curl_off_t VmsSpecialSize(const char *name,
                                  const curlx_struct_stat *stat_buf)
@@ -184,11 +238,31 @@ static curl_off_t VmsSpecialSize(const char *name,
 }
 #endif /* __VMS */
 
+/**
+ * @brief Head of the global list of transfers (first node).
+ * @see add_per_transfer(), del_per_transfer()
+ */
 struct per_transfer *transfers; /* first node */
+/**
+ * @internal
+ * @brief Tail of the global list of transfers (last node).
+ */
 static struct per_transfer *transfersl; /* last node */
 
 /* add_per_transfer creates a new 'per_transfer' node in the linked
    list of transfers */
+/**
+ * @internal
+ * @brief Create a new per_transfer node and append it to the list.
+ *
+ * The node is zero-initialised and linked at the tail of the global
+ * transfers list.
+ *
+ * @param[out] per Receives the new node on success; untouched on failure.
+ * @return CURLE_OK on success, CURLE_OUT_OF_MEMORY if allocation failed.
+ * @post On success the node is owned by the list and must be released with
+ *       del_per_transfer().
+ */
 static CURLcode add_per_transfer(struct per_transfer **per)
 {
   struct per_transfer *p;
@@ -213,6 +287,17 @@ static CURLcode add_per_transfer(struct per_transfer **per)
 
 /* Remove the specified transfer from the list (and free it), return the next
    in line */
+/**
+ * @internal
+ * @brief Remove a transfer from the list, free it and return the next one.
+ *
+ * Releases every resource owned by the node (output file, easy handle,
+ * URL strings, header lists and so on).
+ *
+ * @param[in] per Node to remove; must be a member of the list.
+ * @return The node that followed @p per, or NULL if it was the last one.
+ * @warning @p per is invalid after the call, do not use it again.
+ */
 static struct per_transfer *del_per_transfer(struct per_transfer *per)
 {
   struct per_transfer *n;
@@ -243,6 +328,18 @@ static struct per_transfer *del_per_transfer(struct per_transfer *per)
   return n;
 }
 
+/**
+ * @internal
+ * @brief Prepare a transfer right before it starts.
+ *
+ * Determines the size of the upload file (if any), sets the input size
+ * option on the easy handle and records the start time.
+ *
+ * @param[in,out] per Transfer about to be performed.
+ * @return CURLE_OK on success, or the error from setting the upload size.
+ * @pre per->curl has been fully configured.
+ * @post per->uploadfilesize and per->start are set.
+ */
 static CURLcode pre_transfer(struct per_transfer *per)
 {
   curl_off_t uploadfilesize = -1;
@@ -319,6 +416,16 @@ static CURLcode pre_transfer(struct per_transfer *per)
   return result;
 }
 
+/**
+ * @brief Free the per-URL state kept in the global State.
+ *
+ * Releases the URL glob, the current upload file name and the upload file
+ * glob. Called when no further transfer can be created from the current
+ * operation config.
+ *
+ * @note Safe to call multiple times.
+ * @see single_transfer()
+ */
 void single_transfer_cleanup(void)
 {
   struct State *state = &global->state;
@@ -329,15 +436,22 @@ void single_transfer_cleanup(void)
   glob_cleanup(&state->inglob);
 }
 
-/* Helper function for retrycheck.
+/**
+ * @internal
+ * @brief Decide if a failed download may be resumed automatically.
  *
- * This function is a prerequisite check used to determine whether or not some
- * already downloaded data (ie out->bytes written) can be safely resumed in a
- * subsequent transfer. The conditions are somewhat pedantic to avoid any risk
- * of data corruption.
+ * Used when retrying a transfer that wrote to a regular output file with
+ * @c --continue-at -. The conditions are somewhat pedantic to avoid any
+ * risk of data corruption.
  *
- * Specific HTTP limitations (scheme, method, response code, etc) are checked
- * in retrycheck if this prerequisite check is met.
+ * Specific HTTP limitations (scheme, method, response code, etc) are
+ * checked in retrycheck() if this prerequisite check is met.
+ *
+ * @param[in] config Operation configuration.
+ * @param[in] per    Transfer that just ended.
+ * @param[in] result Result code of the transfer.
+ * @return TRUE if the next attempt can resume where this one stopped.
+ * @see retrycheck()
  */
 static bool is_outfile_auto_resumable(struct OperationConfig *config,
                                       struct per_transfer *per,
@@ -355,16 +469,36 @@ static bool is_outfile_auto_resumable(struct OperationConfig *config,
     result != CURLE_WRITE_ERROR && result != CURLE_RANGE_ERROR;
 }
 
+/**
+ * @internal
+ * @brief Reason why a transfer is going to be retried.
+ *
+ * Indexes the message table in retry_sleep().
+ */
 enum retryreason {
-  RETRY_NO,
-  RETRY_ALL_ERRORS,
-  RETRY_TIMEOUT,
-  RETRY_CONNREFUSED,
-  RETRY_HTTP,
-  RETRY_FTP
+  RETRY_NO, ///< no retry
+  RETRY_ALL_ERRORS, ///< --retry-all-errors
+  RETRY_TIMEOUT, ///< timeout or DNS
+  RETRY_CONNREFUSED, ///< connection refused
+  RETRY_HTTP, ///< HTTP status
+  RETRY_FTP ///< FTP 4xx
 };
 
-/* figure out how long to wait until retry */
+/**
+ * @internal
+ * @brief Figure out how long to wait until the next retry.
+ *
+ * Uses exponential backoff unless a fixed delay was requested, then
+ * prints the retry message. If the retry budget is exhausted, no retry
+ * is scheduled.
+ *
+ * @param[in]     config Operation configuration (retry delay and limits).
+ * @param[in,out] per    Transfer; its retry counters are updated.
+ * @param[in]     retry  Reason for the retry, selects the message printed.
+ * @param[out]    retryp Set to FALSE if the retry limit was reached.
+ * @return Delay in milliseconds before the next attempt.
+ * @see retrycheck()
+ */
 static uint32_t retry_sleep(struct OperationConfig *config,
                             struct per_transfer *per,
                             enum retryreason retry,
@@ -430,6 +564,23 @@ static uint32_t retry_sleep(struct OperationConfig *config,
   return sleeptime;
 }
 
+/**
+ * @internal
+ * @brief Decide whether a finished transfer should be retried.
+ *
+ * Looks at the result code, the HTTP status and FTP response to match
+ * transient conditions (timeouts, DNS failures, refused connections,
+ * HTTP 408/429/5xx, FTP 4xx) and the @c --retry options.
+ *
+ * @param[in]     config  Operation configuration.
+ * @param[in,out] per     Transfer that just ended.
+ * @param[in]     result  Result of the transfer.
+ * @param[out]    retryp  Set to TRUE when the transfer should be retried.
+ * @param[out]    delayms Delay before the retry, in milliseconds.
+ * @return @p result unchanged, or CURLE_OK when a retry is scheduled.
+ * @note When retrying, the output file may be truncated or reopened for
+ *       appending depending on is_outfile_auto_resumable().
+ */
 static CURLcode retrycheck(struct OperationConfig *config,
                            struct per_transfer *per,
                            CURLcode result,
@@ -610,6 +761,18 @@ static CURLcode retrycheck(struct OperationConfig *config,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Post-process the result of a transfer (error reporting).
+ *
+ * Maps failures to messages, handles @c --fail-with-body, the certificate
+ * hint and the VMS exit status.
+ *
+ * @param[in,out] per    Transfer that ended.
+ * @param[in]     result  Result code from libcurl.
+ * @return The (possibly adjusted) result code; CURLE_HTTP_RETURNED_ERROR
+ *         when --fail-with-body saw an HTTP status of 400 or above.
+ */
 static CURLcode post_check_result(struct per_transfer *per, CURLcode result)
 {
   struct OperationConfig *config = per->config;
@@ -644,6 +807,17 @@ static CURLcode post_check_result(struct per_transfer *per, CURLcode result)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Finalise output handling after the transfer.
+ *
+ * Flushes the output stream, applies remote time and removes partial
+ * output on failure when requested.
+ *
+ * @param[in,out] per    Transfer that ended.
+ * @param[in]     result  Result code so far.
+ * @return @p result, or CURLE_WRITE_ERROR if flushing failed.
+ */
 static CURLcode post_output_handling(struct per_transfer *per,
                                      CURLcode result)
 {
@@ -696,6 +870,15 @@ static CURLcode post_output_handling(struct per_transfer *per,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Close the output, header and ETag files of a transfer.
+ *
+ * @param[in,out] per    Transfer that ended.
+ * @param[in]     result  Result code so far.
+ * @return @p result, or CURLE_WRITE_ERROR if closing a file failed.
+ * @post The stream pointers in @p per are no longer valid.
+ */
 static CURLcode post_close_output(struct per_transfer *per,
                                   CURLcode result)
 {
@@ -737,8 +920,19 @@ static CURLcode post_close_output(struct per_transfer *per,
   return result;
 }
 
-/*
- * Call this after a transfer has completed.
+/**
+ * @internal
+ * @brief Handle everything that happens after a transfer has completed.
+ *
+ * Runs result checks, decides on retries, closes files, writes the
+ * @c --write-out data and the ETag, and applies --remove-on-error.
+ *
+ * @param[in,out] per    Transfer that ended.
+ * @param[in]     result  Result code of the transfer.
+ * @param[out]    retryp  Set to TRUE if the transfer must be run again.
+ * @param[out]    delay   Retry delay in milliseconds, 0 when no retry.
+ * @return The final result code for this transfer.
+ * @see retrycheck(), post_check_result()
  */
 static CURLcode post_per_transfer(struct per_transfer *per,
                                   CURLcode result,
@@ -817,6 +1011,16 @@ static CURLcode post_per_transfer(struct per_transfer *per,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Pick implicit certificate and key types.
+ *
+ * A PKCS#11 URI given as certificate or key makes the type "ENG" when no
+ * type was set. Does nothing without SSL support.
+ *
+ * @param[in,out] config Operation configuration.
+ * @return CURLE_OK, or CURLE_OUT_OF_MEMORY if a string copy failed.
+ */
 static CURLcode set_cert_types(struct OperationConfig *config)
 {
   if(feature_ssl) {
@@ -857,6 +1061,18 @@ static CURLcode set_cert_types(struct OperationConfig *config)
   return CURLE_OK;
 }
 
+/**
+ * @internal
+ * @brief Append a query string to the URL of a transfer.
+ *
+ * Implements @c --url-query by parsing the URL with the URL API and adding
+ * the part to the query.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] per    Transfer whose URL is rewritten.
+ * @param[in]     q      Query part to append; may be NULL for no-op.
+ * @return CURLE_OK, CURLE_OUT_OF_MEMORY or CURLE_URL_MALFORMAT on error.
+ */
 static CURLcode append2query(struct OperationConfig *config,
                              struct per_transfer *per,
                              const char *q)
@@ -899,6 +1115,17 @@ static CURLcode append2query(struct OperationConfig *config,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Read the ETag from the @c --etag-compare file.
+ *
+ * Builds the "If-None-Match" header from the first line of the file and
+ * adds it to the custom request headers.
+ *
+ * @param[in,out] config Operation configuration, headers are appended.
+ * @return CURLE_OK (also when the file does not exist), or
+ *         CURLE_OUT_OF_MEMORY.
+ */
 static CURLcode etag_compare(struct OperationConfig *config)
 {
   CURLcode result = CURLE_OK;
@@ -945,6 +1172,17 @@ static CURLcode etag_compare(struct OperationConfig *config)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Prepare the @c --etag-save output.
+ *
+ * Creates directories when requested and opens the file (or uses stdout).
+ *
+ * @param[in]     config    Operation configuration.
+ * @param[in,out] etag_save Output descriptor to fill in.
+ * @param[out]    skip      Set to TRUE if the transfer must be skipped.
+ * @return CURLE_OK, or the error from directory creation.
+ */
 static CURLcode etag_store(struct OperationConfig *config,
                            struct OutStruct *etag_save,
                            bool *skip)
@@ -978,6 +1216,18 @@ static CURLcode etag_store(struct OperationConfig *config,
   return CURLE_OK;
 }
 
+/**
+ * @internal
+ * @brief Open the @c --dump-header file.
+ *
+ * Handles "-" (stdout), "%" (stderr) and regular files, which are opened
+ * in binary mode.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] per    Transfer owning the header output.
+ * @param[in,out] heads  Header output descriptor to fill in.
+ * @return CURLE_OK, or CURLE_WRITE_ERROR if the file cannot be opened.
+ */
 static CURLcode setup_headerfile(struct OperationConfig *config,
                                  struct per_transfer *per,
                                  struct OutStruct *heads)
@@ -1033,7 +1283,21 @@ static CURLcode setup_headerfile(struct OperationConfig *config,
   return CURLE_OK;
 }
 
-/* figure out and populate per->outfile */
+/**
+ * @internal
+ * @brief Figure out and populate the output file name (per->outfile).
+ *
+ * Derives the name from @c -o / @c -O, creates directories, avoids
+ * clobbering existing files when asked and handles resume.
+ *
+ * @param[in]     config  Operation configuration.
+ * @param[in,out] per     Transfer to configure.
+ * @param[in]     u       URL node holding the output options.
+ * @param[in,out] outs    Output descriptor to fill in.
+ * @param[out]    skipped Set to TRUE if this transfer must be skipped.
+ * @return CURLE_OK, CURLE_WRITE_ERROR, CURLE_OUT_OF_MEMORY or the error
+ *         from directory creation.
+ */
 static CURLcode setup_outfile(struct OperationConfig *config,
                               struct per_transfer *per,
                               struct getout *u,
@@ -1174,6 +1438,16 @@ static CURLcode setup_outfile(struct OperationConfig *config,
   return CURLE_OK;
 }
 
+/**
+ * @internal
+ * @brief Prepare uploading from stdin.
+ *
+ * Warns about multiple auth methods (needs a rewindable body), switches
+ * stdin to non-blocking if requested and sets the input file descriptor.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] per    Transfer being set up.
+ */
 static void check_stdin_upload(struct OperationConfig *config,
                                struct per_transfer *per)
 {
@@ -1234,6 +1508,19 @@ static void check_stdin_upload(struct OperationConfig *config,
   }
 }
 
+/**
+ * @internal
+ * @brief Fill in the data struct passed to the header callback.
+ *
+ * @param[in]  config    Operation configuration.
+ * @param[out] hdrcbdata Callback data to populate.
+ * @param[in]  u         URL node (decides Content-Disposition naming).
+ * @param[in]  outs      Body output descriptor.
+ * @param[in]  heads     Header output descriptor.
+ * @param[in]  etag      ETag output descriptor.
+ * @warning The pointers are stored, not copied: they must outlive the
+ *          transfer.
+ */
 static void setup_header_cb(struct OperationConfig *config,
                             struct HdrCbData *hdrcbdata,
                             struct getout *u,
@@ -1248,6 +1535,16 @@ static void setup_header_cb(struct OperationConfig *config,
   hdrcbdata->config = config;
 }
 
+/**
+ * @internal
+ * @brief Resolve the upload file name from a --upload-file glob.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] state  Global iteration state (glob and upload name).
+ * @param[in]     u      URL node with the upload file specification.
+ * @param[in]     err    Stream for glob error messages.
+ * @return CURLE_OK, or a glob/memory error code.
+ */
 static CURLcode setup_input_file(struct OperationConfig *config,
                                  struct State *state, struct getout *u,
                                  FILE *err)
@@ -1270,6 +1567,19 @@ static CURLcode setup_input_file(struct OperationConfig *config,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Expand the URL pattern into a list of URLs.
+ *
+ * Unless globbing is turned off, '{...}' and '[...]' expressions are
+ * expanded and the total URL count is stored in state->urlnum.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] state  Global iteration state.
+ * @param[in]     u      URL node with the pattern.
+ * @param[in]     err    Stream for glob error messages.
+ * @return CURLE_OK, or the error from glob_url().
+ */
 static CURLcode setup_url_pattern(struct OperationConfig *config,
                                   struct State *state, struct getout *u,
                                   FILE *err)
@@ -1287,6 +1597,15 @@ static CURLcode setup_url_pattern(struct OperationConfig *config,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Set up the @c --etag-save and @c --etag-compare handling.
+ *
+ * @param[in]  config     Operation configuration.
+ * @param[out] etag_save  ETag output descriptor, zeroed and initialised.
+ * @param[out] break_loop Set to TRUE if no transfer should be made.
+ * @return CURLE_OK or the error from etag_store() / etag_compare().
+ */
 static CURLcode setup_etag_files(struct OperationConfig *config,
                                  struct OutStruct *etag_save,
                                  bool *break_loop)
@@ -1316,6 +1635,18 @@ static CURLcode setup_etag_files(struct OperationConfig *config,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Select the URL for the next transfer.
+ *
+ * Takes the next glob result, or the literal URL for the first iteration.
+ *
+ * @param[in,out] state Global iteration state.
+ * @param[in]     u     URL node.
+ * @param[out]    url   Newly allocated URL, or NULL when none is left.
+ * @return CURLE_OK or CURLE_OUT_OF_MEMORY.
+ * @note The caller owns the returned string.
+ */
 static CURLcode select_next_url(struct State *state,
                                 struct getout *u,
                                 char **url)
@@ -1334,6 +1665,17 @@ static CURLcode select_next_url(struct State *state,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Configure the upload part of a transfer.
+ *
+ * Handles stdin uploads and appends the file name to URLs that end with a
+ * slash.
+ *
+ * @param[in]     config Operation configuration.
+ * @param[in,out] per    Transfer being set up.
+ * @return CURLE_OK or the error from add_file_name_to_url().
+ */
 static CURLcode setup_transfer_upload(struct OperationConfig *config,
                                       struct per_transfer *per)
 {
@@ -1354,7 +1696,15 @@ static CURLcode setup_transfer_upload(struct OperationConfig *config,
   return result;
 }
 
-/* returns TRUE if the given stream is a terminal */
+/**
+ * @internal
+ * @brief Tell whether the given stream is a terminal.
+ *
+ * @param[in] stream Stream to test.
+ * @return TRUE for a terminal, FALSE otherwise.
+ * @note Debug builds honour the CURL_ISATTY environment variable, which the
+ *       test suite uses to simulate a terminal.
+ */
 static bool stream_isatty(FILE *stream)
 {
 #ifdef DEBUGBUILD
@@ -1366,7 +1716,22 @@ static bool stream_isatty(FILE *stream)
   return !!isatty(fileno(stream));
 }
 
-/* create a transfer */
+/**
+ * @internal
+ * @brief Create a single transfer for the next URL.
+ *
+ * Allocates a per_transfer, configures output, headers, upload and every
+ * easy option from the config, and registers it for execution.
+ *
+ * @param[in,out] config  Operation configuration.
+ * @param[in]     share   Share object attached to the easy handle.
+ * @param[in,out] state   Global iteration state.
+ * @param[out]    added   Set to TRUE if a transfer was created.
+ * @param[out]    skipped Set to TRUE if the URL was skipped.
+ * @return CURLE_OK on success, or the error that prevented creation
+ *         (for example CURLE_OUT_OF_MEMORY or CURLE_FAILED_INIT).
+ * @post On success *added is TRUE and the node is in the transfers list.
+ */
 static CURLcode create_single(struct OperationConfig *config,
                               CURLSH *share, struct State *state,
                               bool *added, bool *skipped)
@@ -1518,7 +1883,20 @@ static CURLcode create_single(struct OperationConfig *config,
   return result;
 }
 
-/* create the next (singular) transfer */
+/**
+ * @internal
+ * @brief Create the next (singular) transfer.
+ *
+ * Prepares the URL and upload glob state, folds @c --get fields into the
+ * query and calls create_single().
+ *
+ * @param[in,out] config  Operation configuration.
+ * @param[in]     share   Share object for the new handle.
+ * @param[out]    added   Set to TRUE if a transfer was added.
+ * @param[out]    skipped Set to TRUE if the URL was skipped.
+ * @return CURLE_OK or an error from setup.
+ * @see create_single()
+ */
 static CURLcode single_transfer(struct OperationConfig *config,
                                 CURLSH *share, bool *added, bool *skipped)
 {
@@ -1558,12 +1936,24 @@ static CURLcode single_transfer(struct OperationConfig *config,
   return create_single(config, share, state, added, skipped);
 }
 
+/**
+ * @internal
+ * @brief Number of easy handles currently added to the multi handle.
+ */
 static long all_added; /* number of easy handles currently added */
 
-/*
- * add_parallel_transfers() sets 'morep' to TRUE if there are more transfers
- * to add even after this call returns. sets 'addedp' to TRUE if one or more
- * transfers were added.
+/**
+ * @internal
+ * @brief Add transfers to the multi handle up to the parallel limit.
+ *
+ * Creates new transfers when needed and adds them to the multi handle,
+ * honouring @c --parallel-max and per-transfer start delays (retries).
+ *
+ * @param[in]  multi  Multi handle.
+ * @param[in]  share  Share object for new transfers.
+ * @param[out] morep  TRUE if more transfers may still be added later.
+ * @param[out] addedp TRUE if one or more transfers were added.
+ * @return CURLE_OK, or the error that stopped creating transfers.
  */
 static CURLcode add_parallel_transfers(CURLM *multi, CURLSH *share,
                                        bool *morep, bool *addedp)
@@ -1656,43 +2046,71 @@ static CURLcode add_parallel_transfers(CURLM *multi, CURLSH *share,
   return CURLE_OK;
 }
 
+/**
+ * @internal
+ * @brief State of a parallel run (shared with the callbacks).
+ */
 struct parastate {
-  CURLM *multi;
-  CURLSH *share;
-  CURLMcode mcode;
-  CURLcode result;
-  int still_running;
-  struct curltime start;
-  bool more_transfers;
-  bool added_transfers;
+  CURLM *multi; ///< multi handle
+  CURLSH *share; ///< share object
+  CURLMcode mcode; ///< last multi code
+  CURLcode result; ///< first transfer error
+  int still_running; ///< running transfers
+  struct curltime start; ///< start time
+  bool more_transfers; ///< more may be added
+  bool added_transfers; ///< any added this round
   /* wrapitup is set TRUE after a critical error occurs to end all transfers */
   bool wrapitup;
   /* wrapitup_processed is set TRUE after the per transfer abort flag is set */
   bool wrapitup_processed;
-  time_t tick;
+  time_t tick; ///< last progress tick
 };
 
 #if defined(DEBUGBUILD) && defined(USE_LIBUV)
 
+/**
+ * @internal
+ * @brief Debug switch for libuv event tracing (0 = off).
+ */
 #define DEBUG_UV 0
 
-/* object to pass to the callbacks */
+/**
+ * @internal
+ * @brief Object passed to the libuv/libcurl callbacks.
+ */
 struct datauv {
-  uv_timer_t timeout;
-  uv_loop_t *loop;
-  struct parastate *s;
+  uv_timer_t timeout; ///< timeout timer
+  uv_loop_t *loop; ///< event loop
+  struct parastate *s; ///< parent state
 };
 
+/**
+ * @internal
+ * @brief Per-socket context for libuv polling.
+ */
 struct contextuv {
-  uv_poll_t poll_handle;
-  curl_socket_t sockfd;
-  struct datauv *uv;
+  uv_poll_t poll_handle; ///< poll handle
+  curl_socket_t sockfd; ///< watched socket
+  struct datauv *uv; ///< owner
 };
 
+/**
+ * @brief Forward declaration of the multi notification callback.
+ * @see mnotify()
+ */
 static void mnotify(CURLM *multi, unsigned int notification,
                     CURL *easy, void *user_data);
 
-/* callback from libuv on socket activity */
+/**
+ * @internal
+ * @brief libuv callback on socket activity.
+ *
+ * Translates libuv events into CURL_CSELECT_* flags and informs libcurl.
+ *
+ * @param[in] req    Poll handle; its data points to a contextuv.
+ * @param[in] status libuv status (unused).
+ * @param[in] events UV_READABLE and/or UV_WRITABLE bits.
+ */
 static void on_uv_socket(uv_poll_t *req, int status, int events)
 {
   int flags = 0;
@@ -1708,7 +2126,12 @@ static void on_uv_socket(uv_poll_t *req, int status, int events)
   progress_meter(c->uv->s->multi, &c->uv->s->start, FALSE);
 }
 
-/* callback from libuv when timeout expires */
+/**
+ * @internal
+ * @brief libuv callback when the timeout expires.
+ *
+ * @param[in] req Timer handle; its data points to a datauv.
+ */
 static void on_uv_timeout(uv_timer_t *req)
 {
   struct datauv *uv = (struct datauv *)req->data;
@@ -1722,7 +2145,15 @@ static void on_uv_timeout(uv_timer_t *req)
   }
 }
 
-/* callback from libcurl to update the timeout expiry */
+/**
+ * @internal
+ * @brief libcurl callback to update the timeout expiry.
+ *
+ * @param[in] multi      Multi handle (unused).
+ * @param[in] timeout_ms New timeout, -1 deletes the timer, 0 means asap.
+ * @param[in] userp      The datauv object.
+ * @return Always 0.
+ */
 static int cb_timeout(CURLM *multi, long timeout_ms, void *userp)
 {
   struct datauv *uv = userp;
@@ -1742,6 +2173,14 @@ static int cb_timeout(CURLM *multi, long timeout_ms, void *userp)
   return 0;
 }
 
+/**
+ * @internal
+ * @brief Allocate a socket context and init its poll handle.
+ *
+ * @param[in] sockfd Socket to watch.
+ * @param[in] uv     Owning datauv.
+ * @return New context; released by close_cb() after destroy_context().
+ */
 static struct contextuv *create_context(curl_socket_t sockfd,
                                         struct datauv *uv)
 {
@@ -1756,18 +2195,41 @@ static struct contextuv *create_context(curl_socket_t sockfd,
   return c;
 }
 
+/**
+ * @internal
+ * @brief libuv close callback; frees the socket context.
+ *
+ * @param[in] handle Closed poll handle, its data is the contextuv.
+ */
 static void close_cb(uv_handle_t *handle)
 {
   struct contextuv *c = (struct contextuv *)handle->data;
   curlx_free(c);
 }
 
+/**
+ * @internal
+ * @brief Start closing the poll handle of a socket context.
+ *
+ * @param[in] c Context to destroy.
+ * @warning The memory is freed asynchronously by close_cb().
+ */
 static void destroy_context(struct contextuv *c)
 {
   uv_close((uv_handle_t *)&c->poll_handle, close_cb);
 }
 
-/* callback from libcurl to update socket activity to wait for */
+/**
+ * @internal
+ * @brief libcurl callback to update the socket activity to wait for.
+ *
+ * @param[in] easy    Easy handle (unused).
+ * @param[in] s       Socket.
+ * @param[in] action  CURL_POLL_IN, _OUT, _INOUT or _REMOVE.
+ * @param[in] userp   The datauv object.
+ * @param[in] socketp Per-socket context set earlier, or NULL.
+ * @return 0 on success, -1 on an unknown action.
+ */
 static int cb_socket(CURL *easy, curl_socket_t s, int action,
                      void *userp, void *socketp)
 {
@@ -1811,6 +2273,13 @@ static int cb_socket(CURL *easy, curl_socket_t s, int action,
   return 0;
 }
 
+/**
+ * @internal
+ * @brief Run the parallel transfers using libuv (debug builds only).
+ *
+ * @param[in,out] s Parallel state.
+ * @return CURLE_OK, or the first failing transfer result.
+ */
 static CURLcode parallel_event(struct parastate *s)
 {
   CURLcode result = CURLE_OK;
@@ -1907,6 +2376,18 @@ static CURLcode parallel_event(struct parastate *s)
 
 #endif
 
+/**
+ * @internal
+ * @brief Handle finished transfers reported by the multi handle.
+ *
+ * Reads messages with curl_multi_info_read(), runs post_per_transfer(),
+ * schedules retries and removes completed handles.
+ *
+ * @param[in,out] s Parallel state.
+ * @return CURLE_OK, or the first failure; sets s->wrapitup on fatal
+ *         errors or when --fail-early is active.
+ * @see post_per_transfer()
+ */
 static CURLcode check_finished(struct parastate *s)
 {
   CURLcode result = CURLE_OK;
@@ -1975,6 +2456,18 @@ static CURLcode check_finished(struct parastate *s)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Multi notification callback.
+ *
+ * On CURLMNOTIFY_INFO_READ it calls check_finished(), remembering the
+ * first failure in the parallel state.
+ *
+ * @param[in] multi        Multi handle (unused).
+ * @param[in] notification Kind of notification.
+ * @param[in] easy         Easy handle (unused).
+ * @param[in] user_data    The parastate.
+ */
 static void mnotify(CURLM *multi, unsigned int notification,
                     CURL *easy, void *user_data)
 {
@@ -1996,6 +2489,15 @@ static void mnotify(CURLM *multi, unsigned int notification,
   }
 }
 
+/**
+ * @internal
+ * @brief Run all transfers in parallel with one multi handle.
+ *
+ * @param[in] share Share object.
+ * @return CURLE_OK, or the first transfer error; CURLE_FAILED_INIT if the
+ *         multi handle cannot be set up.
+ * @see add_parallel_transfers(), check_finished()
+ */
 static CURLcode parallel_transfers(CURLSH *share)
 {
   CURLcode result;
@@ -2096,6 +2598,15 @@ static CURLcode parallel_transfers(CURLSH *share)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Run all transfers one after another.
+ *
+ * @param[in] share Share object.
+ * @return CURLE_OK, the first transfer failure, or CURLE_READ_ERROR when
+ *         no transfer could be created.
+ * @see parallel_transfers()
+ */
 static CURLcode serial_transfers(CURLSH *share)
 {
   CURLcode returncode = CURLE_OK;
@@ -2202,6 +2713,15 @@ static CURLcode serial_transfers(CURLSH *share)
 #ifdef _WIN32
 /* returns TRUE if using Schannel or if there is an error, passes back result
    in 'resultp' */
+/**
+ * @internal
+ * @brief Check if the TLS backend is Schannel (Windows only).
+ *
+ * The answer is cached after the first call.
+ *
+ * @param[out] resultp Result of the backend query.
+ * @return TRUE if Schannel is used or an error occurred, else FALSE.
+ */
 static bool win32_using_schannel(CURLcode *resultp)
 {
   static int using_schannel = -1; /* -1 = not checked
@@ -2229,6 +2749,13 @@ static bool win32_using_schannel(CURLcode *resultp)
   return using_schannel == 1;
 }
 
+/**
+ * @internal
+ * @brief Find the CA bundle on Windows (Windows only).
+ *
+ * @param[in,out] config Operation configuration, cacert may be set.
+ * @return CURLE_OK or CURLE_OUT_OF_MEMORY.
+ */
 static CURLcode win32_setup_certs(struct OperationConfig *config)
 {
   if(!config->capath && !config->cacert) {
@@ -2250,20 +2777,25 @@ static CURLcode win32_setup_certs(struct OperationConfig *config)
   return CURLE_OK;
 }
 #else
+/**
+ * @internal
+ * @brief Stubs for non-Windows builds, always succeed or return FALSE.
+ */
 #define win32_setup_certs(x) CURLE_OK
 #define win32_using_schannel(x) FALSE
 #endif
 
-/* Set the CA cert locations specified in the environment. For Windows if no
- * environment-specified filename is found then check for CA bundle default
- * filename curl-ca-bundle.crt in the user's PATH.
+/**
+ * @internal
+ * @brief Set the CA cert locations specified in the environment.
  *
- * If the user has set a CA cert/path or disabled peer verification (including
- * for DoH, so completely disabled) then these locations are ignored.
+ * For Windows, if no environment-specified file name is found, the CA
+ * bundle is searched for in the same places as for libcurl, unless that is
+ * disabled. Ignored with --insecure, explicit --cacert/--capath, and
+ * when Schannel is the backend.
  *
- * If Schannel is the selected SSL backend then these locations are ignored.
- * We allow setting CA location for Schannel only when explicitly specified by
- * the user via CURLOPT_CAINFO / --cacert.
+ * @param[in,out] config Operation configuration, may set cacert/capath.
+ * @return CURLE_OK or CURLE_OUT_OF_MEMORY.
  */
 static CURLcode cacertpaths(struct OperationConfig *config)
 {
@@ -2312,7 +2844,17 @@ static CURLcode cacertpaths(struct OperationConfig *config)
   return result;
 }
 
-/* setup a transfer for the given config */
+/**
+ * @internal
+ * @brief Set up a transfer for the given config.
+ *
+ * @param[in,out] config  Operation configuration.
+ * @param[in]     share   Share object.
+ * @param[out]    added   TRUE if a transfer was created.
+ * @param[out]    skipped TRUE if the URL was skipped.
+ * @return CURLE_OK, CURLE_FAILED_INIT when no URL was given, or another
+ *         setup error.
+ */
 static CURLcode transfer_per_config(struct OperationConfig *config,
                                     CURLSH *share,
                                     bool *added,
@@ -2338,9 +2880,16 @@ static CURLcode transfer_per_config(struct OperationConfig *config,
   return result;
 }
 
-/*
- * 'create_transfer' gets the details and sets up a new transfer if 'added'
- * returns TRUE.
+/**
+ * @internal
+ * @brief Get the details and set up a new transfer.
+ *
+ * Walks the chain of operation configs until one yields a transfer.
+ *
+ * @param[in]  share   Share object.
+ * @param[out] added   TRUE if a transfer was added.
+ * @param[out] skipped TRUE if the URL was skipped.
+ * @return CURLE_OK or the error from transfer_per_config().
  */
 static CURLcode create_transfer(CURLSH *share,
                                 bool *added,
@@ -2360,6 +2909,16 @@ static CURLcode create_transfer(CURLSH *share,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Run all transfers, serially or in parallel, then clean up.
+ *
+ * @param[in] share  Share object.
+ * @param[in] result Result so far; transfers only run if it is CURLE_OK.
+ * @return The result of the run.
+ * @post Global noprogress/isatty flags are restored and the transfer
+ *       list is freed.
+ */
 static CURLcode run_all_transfers(CURLSH *share,
                                   CURLcode result)
 {
@@ -2401,6 +2960,14 @@ static CURLcode run_all_transfers(CURLSH *share,
   return result;
 }
 
+/**
+ * @internal
+ * @brief Enable sharing of one kind of data.
+ *
+ * @param[in] share Share object.
+ * @param[in] opt   CURL_LOCK_DATA_* value.
+ * @return CURLE_OK (also when unsupported), else CURLE_FAILED_INIT.
+ */
 static CURLcode share_setopt(CURLSH *share, int opt)
 {
   CURLSHcode shres = curl_share_setopt(share, CURLSHOPT_SHARE, opt);
@@ -2409,6 +2976,13 @@ static CURLcode share_setopt(CURLSH *share, int opt)
   return CURLE_FAILED_INIT;
 }
 
+/**
+ * @internal
+ * @brief Enable sharing of cookies, DNS, TLS sessions, PSL, HSTS, etc.
+ *
+ * @param[in] share Share object.
+ * @return CURLE_OK, or CURLE_FAILED_INIT.
+ */
 static CURLcode share_setup(CURLSH *share)
 {
   CURLcode result = CURLE_OK;
@@ -2430,6 +3004,20 @@ static CURLcode share_setup(CURLSH *share)
   return result;
 }
 
+/**
+ * @brief Run the curl tool.
+ *
+ * Reads .curlrc, parses arguments, handles help/manual/version requests,
+ * sets up the share object and executes every transfer.
+ *
+ * @param[in] argc Number of arguments.
+ * @param[in] argv Arguments (wide characters on Windows Unicode builds).
+ * @return CURLE_OK on success, or the CURLcode of the first failure
+ *         (CURLE_FAILED_INIT for usage errors, CURLE_READ_ERROR,
+ *         CURLE_UNSUPPORTED_PROTOCOL, CURLE_OUT_OF_MEMORY).
+ * @pre The global configuration has been initialised.
+ * @post The caller must call globalconf_free().
+ */
 CURLcode operate(int argc, argv_item_t argv[])
 {
   CURLcode result = CURLE_OK;

@@ -21,6 +21,33 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file
+ * @brief Implementation of the URL API (CURLU handle, curl_url_*()).
+ *
+ * This file implements the public libcurl URL parsing and manipulation API:
+ * curl_url(), curl_url_dup(), curl_url_cleanup(), curl_url_get() and
+ * curl_url_set(). A CURLU handle stores the individual components of a URL
+ * (scheme, user, password, options, host, zone id, port, path, query and
+ * fragment) as separately allocated strings so each can be read or replaced
+ * independently, then re-assembled into a full URL on demand.
+ *
+ * Besides the public API it contains the helpers used by the rest of the
+ * library to validate hostnames, normalize IPv4/IPv6 addresses, URL-encode
+ * and decode parts, resolve relative references (RFC 3986 section 5.2) and
+ * remove dot segments.
+ *
+ * @note Strings handed out by curl_url_get() are allocated and must be
+ *       released by the caller with curl_free().
+ * @warning A CURLU handle is not thread-safe. Callers must serialize access
+ *          to one handle; independent handles may be used concurrently.
+ * @see https://datatracker.ietf.org/doc/html/rfc3986
+ * @see https://curl.se/libcurl/c/libcurl-url.html
+ *
+ * @defgroup urlapi URL API
+ * @brief Parsing, validation and (re)assembly of URLs held in a CURLU handle.
+ * @{
+ */
 #include "curl_setup.h"
 
 #include "urldata.h"
@@ -36,36 +63,85 @@
 #include "curl_memrchr.h"
 
 #ifdef _WIN32
-/* MS-DOS/Windows style drive prefix, eg c: in c:foo */
+/**
+ * @def STARTS_WITH_DRIVE_PREFIX
+ * @brief Test whether a string begins with a Windows drive prefix.
+ *
+ * Matches an ASCII letter followed by a colon, for example "c:" in "c:foo".
+ * Only defined on Windows builds.
+ *
+ * @param[in] str NUL-terminated string, at least two readable bytes.
+ * @return Non-zero when the string starts with "<letter>:".
+ */
 #define STARTS_WITH_DRIVE_PREFIX(str)        \
   ((('a' <= (str)[0] && (str)[0] <= 'z') ||  \
     ('A' <= (str)[0] && (str)[0] <= 'Z')) && \
    ((str)[1] == ':'))
 #endif
 
-/* MS-DOS/Windows style drive prefix, optionally with
- * a '|' instead of ':', followed by a slash or NUL */
+/**
+ * @def STARTS_WITH_URL_DRIVE_PREFIX
+ * @brief Test whether a URL path starts with a Windows drive prefix.
+ *
+ * Matches an ASCII letter, then ':' or '|', then a slash, a backslash or the
+ * terminating NUL. The '|' variant is the legacy file: URL spelling.
+ *
+ * @param[in] str NUL-terminated string, at least three readable bytes
+ *                (the third is only read if the first two match).
+ * @return Non-zero when the prefix matches.
+ */
 #define STARTS_WITH_URL_DRIVE_PREFIX(str)                  \
   ((('a' <= (str)[0] && (str)[0] <= 'z') ||                \
     ('A' <= (str)[0] && (str)[0] <= 'Z')) &&               \
    ((str)[1] == ':' || (str)[1] == '|') &&                 \
    ((str)[2] == '/' || (str)[2] == '\\' || (str)[2] == 0))
 
-/* scheme is not URL encoded, the longest libcurl supported ones are... */
+/**
+ * @def MAX_SCHEME_LEN
+ * @brief Maximum accepted scheme length in bytes (without the terminator).
+ *
+ * The scheme is never URL encoded; 40 is longer than any scheme libcurl
+ * supports.
+ */
 #define MAX_SCHEME_LEN 40
+/**
+ * @def MAX_ZONEID_LEN
+ * @brief Size of the buffer used to hold an IPv6 zone id, including the NUL.
+ */
 #define MAX_ZONEID_LEN 16
 
-/*
- * If USE_IPV6 is disabled, we still want to parse IPv6 addresses, so make
- * sure we have _some_ value for AF_INET6 without polluting our fake value
- * everywhere.
+/**
+ * @def AF_INET6
+ * @brief Fallback address family value when IPv6 support is disabled.
+ *
+ * If USE_IPV6 is disabled, IPv6 addresses must still be parsed, so make
+ * sure there is _some_ value for AF_INET6 without polluting the fake value
+ * everywhere else.
  */
 #if !defined(USE_IPV6) && !defined(AF_INET6)
 #define AF_INET6 (AF_INET + 1)
 #endif
 
+/**
+ * @def DEFAULT_SCHEME
+ * @brief Scheme assumed when CURLU_DEFAULT_SCHEME is set and none is given.
+ */
 #define DEFAULT_SCHEME "https"
 
+/**
+ * @brief Release every string owned by a URL handle.
+ * @internal
+ *
+ * Frees scheme, user, password, options, host, zone id, path, query and
+ * fragment. The password is wiped before it is freed. The handle structure
+ * itself is not freed and the pointers are not reset, so the caller must
+ * either free or overwrite the struct afterwards.
+ *
+ * @param[in,out] u URL handle whose members are released; must not be NULL.
+ * @warning The members are left dangling. Do not use @p u again without
+ *          re-initializing it (memset or struct assignment).
+ * @see curl_url_cleanup()
+ */
 static void free_urlhandle(struct Curl_URL *u)
 {
   curlx_free(u->scheme);
@@ -80,9 +156,17 @@ static void free_urlhandle(struct Curl_URL *u)
   curlx_free(u->fragment);
 }
 
-/*
- * Find the separator at the end of the hostname, or the '?' in cases like
- * http://www.example.com?id=2380
+/**
+ * @brief Find the separator at the end of the hostname.
+ * @internal
+ *
+ * Locates the first '/' or '?' after the authority start, which is how
+ * "http://www.example.com?id=2380" is split. If "//" is present the search
+ * starts after it, otherwise from the beginning of the string.
+ *
+ * @param[in] url NUL-terminated URL (or URL-like string); must not be NULL.
+ * @return Pointer into @p url at the '/' or '?' separator, or at the
+ *         terminating NUL when there is none. Never NULL.
  */
 static const char *find_host_sep(const char *url)
 {
@@ -100,26 +184,45 @@ static const char *find_host_sep(const char *url)
   return sep;
 }
 
-/* convert CURLcode to CURLUcode */
+/**
+ * @def cc2cu
+ * @brief Convert a CURLcode to a CURLUcode.
+ *
+ * @param[in] x A CURLcode result.
+ * @return CURLUE_TOO_LARGE for CURLE_TOO_LARGE, otherwise
+ *         CURLUE_OUT_OF_MEMORY.
+ * @note Only valid for the error codes dynbuf operations can produce.
+ */
 #define cc2cu(x) \
   ((x) == CURLE_TOO_LARGE ? CURLUE_TOO_LARGE : CURLUE_OUT_OF_MEMORY)
 
-/* urlencode_str() writes data into an output dynbuf and URL-encodes the
- * spaces in the source URL accordingly.
+/**
+ * @brief URL-encode what has to be encoded in a URL string into a dynbuf.
+ * @internal
  *
- * This function re-encodes the string, meaning that it leaves already encoded
- * bytes as-is and works by encoding only what *has* to be encoded - unless it
- * has to uppercase the hex to normalize.
+ * Writes the input to @p o and encodes spaces, control bytes (< 0x20) and
+ * bytes >= 0x7f. The function re-encodes: already percent-encoded bytes are
+ * left as-is and only what @b has to be encoded is touched, except that
+ * lowercase hex digits in a valid %xx sequence are uppercased to normalize.
+ * Illegal percent sequences are left untouched.
  *
- * Illegal percent-encoding sequences are left as-is.
+ * URL encoding is skipped for the hostname part (when @p relative is FALSE),
+ * otherwise IDN resolution would fail.
  *
- * URL encoding should be skipped for hostnames, otherwise IDN resolution
- * will fail.
- *
- * 'query' tells if it is a query part or not, or if it is allowed to
- * "transition" into a query part with a question mark.
- *
- * @unittest 1675
+ * @param[in,out] o        Output buffer; data is appended.
+ * @param[in]     url      Input bytes (need not be NUL-terminated).
+ * @param[in]     len      Number of bytes in @p url.
+ * @param[in]     relative TRUE if @p url is a relative reference without
+ *                         scheme and authority; FALSE if the leading
+ *                         "scheme://host" part must be copied untouched.
+ * @param[in]     query    One of QUERY_NO, QUERY_NOT_YET or QUERY_YES. Tells
+ *                         whether this is a query part (spaces become '+'),
+ *                         or whether a '?' may switch to a query part.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_TOO_LARGE if the buffer limit is exceeded.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @post On error @p o may hold partial output; the caller frees it.
+ * @note Unit tested by unit test 1675.
  */
 UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
                                  size_t len, bool relative,
@@ -137,6 +240,8 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
 
   if(!relative) {
     size_t n;
+    /* Non-relative input: copy "scheme://host" verbatim up to the
+       first "/" or "?" and encode only the rest. */
     host_sep = (const unsigned char *)find_host_sep(url);
 
     /* output the first piece as-is */
@@ -145,7 +250,10 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
     len -= n;
   }
 
+  /* Walk the input, handling one special byte or one run of plain
+     bytes per iteration. */
   for(iptr = host_sep; len && !result;) {
+    /* Space: "%20" outside queries, "+" inside a query. */
     if(*iptr == ' ') {
       if(query != QUERY_YES)
         result = curlx_dyn_addn(o, "%20", 3);
@@ -155,6 +263,7 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
       len--;
     }
     else if((*iptr < ' ') || (*iptr >= 0x7f)) {
+      /* Control byte or byte >= 0x7f: percent-encode it. */
       unsigned char out[3] = { '%' };
       Curl_hexbyte(&out[1], *iptr);
       result = curlx_dyn_addn(o, out, 3);
@@ -174,6 +283,7 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
       len -= 3;
     }
     else {
+      /* Plain run: copy as many unremarkable bytes as possible at once. */
       const unsigned char *start = iptr;
       while(len) {
         if(*iptr == ' ' || *iptr < ' ' || *iptr >= 0x7f)
@@ -182,6 +292,7 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
            ISXDIGIT(iptr[1]) && ISXDIGIT(iptr[2]) &&
            (ISLOWER(iptr[1]) || ISLOWER(iptr[2])))
           break;
+        /* The first "?" turns the rest of the string into the query part. */
         if(*iptr == '?') {
           if(query == QUERY_NOT_YET) {
             iptr++;
@@ -202,13 +313,26 @@ UNITTEST CURLUcode urlencode_str(struct dynbuf *o, const char *url,
   return CURLUE_OK;
 }
 
-/*
- * Returns the length of the scheme if the given URL is absolute (as opposed
- * to relative). Stores the scheme in the buffer if TRUE and 'buf' is
- * non-NULL. The buflen must be larger than MAX_SCHEME_LEN if buf is set.
+/**
+ * @brief Tell whether a URL is absolute and return its scheme length.
  *
- * If 'guess_scheme' is TRUE, it means the URL might be provided without
- * scheme.
+ * A URL is absolute when it starts with a syntactically valid scheme
+ * (ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )) followed by a colon. When
+ * @p guess_scheme is TRUE the URL might be given without any scheme, so
+ * the colon must additionally be followed by '/' (otherwise "data:80"
+ * would be a host and port, not a scheme). On Windows a drive prefix such
+ * as "c:" is never treated as a scheme in guessing mode.
+ *
+ * @param[in]  url          NUL-terminated URL to inspect.
+ * @param[out] buf          Optional. Receives the lowercased scheme,
+ *                          NUL-terminated. Always set to a defined value
+ *                          (empty string) when not NULL.
+ * @param[in]  buflen       Size of @p buf; must be larger than
+ *                          MAX_SCHEME_LEN when @p buf is set.
+ * @param[in]  guess_scheme TRUE if the URL may lack a scheme.
+ * @return Length of the scheme (excluding the colon) if the URL is
+ *         absolute, 0 if it is relative.
+ * @pre If @p buf is not NULL then @p buflen > MAX_SCHEME_LEN.
  */
 size_t Curl_is_absolute_url(const char *url, char *buf, size_t buflen,
                             bool guess_scheme)
@@ -222,6 +346,7 @@ size_t Curl_is_absolute_url(const char *url, char *buf, size_t buflen,
   if(guess_scheme && STARTS_WITH_DRIVE_PREFIX(url))
     return 0;
 #endif
+  /* Collect the scheme characters, lowercasing them into buf. */
   if(ISALPHA(url[0])) {
     if(buf)
       buf[0] = Curl_raw_tolower(url[0]);
@@ -252,7 +377,18 @@ size_t Curl_is_absolute_url(const char *url, char *buf, size_t buflen,
   return 0;
 }
 
-/* scan for byte values <= 31, 127 and maybe space */
+/**
+ * @brief Scan for bytes that are not allowed in a URL component.
+ * @internal
+ *
+ * Rejects bytes <= 31 and 127. The space (0x20) is also rejected unless
+ * CURLU_ALLOW_SPACE is present in @p flags.
+ *
+ * @param[in] input Bytes to scan.
+ * @param[in] n     Number of bytes to scan.
+ * @param[in] flags CURLU_* flags; only CURLU_ALLOW_SPACE is examined.
+ * @return TRUE if a forbidden byte was found, FALSE if the data is clean.
+ */
 static bool badoctets(const char *input, size_t n, int flags)
 {
   const uint8_t *p = (const unsigned char *)input;
@@ -265,13 +401,34 @@ static bool badoctets(const char *input, size_t n, int flags)
   return FALSE;
 }
 
-/*
- * parse_hostname_login()
+/**
+ * @brief Extract user, password and options from an authority string.
+ * @internal
  *
- * Parse the login details (username, password and options) from the URL and
- * strip them out of the hostname
+ * Parses the login details of the form
+ * "[user[:password][;options]]\@hostname" and stores them in the handle,
+ * leaving the hostname part to the caller. Options are only parsed for
+ * schemes that set PROTOPT_URLOPTIONS. Previously stored login parts are
+ * replaced. On failure all login members of the handle are cleared.
  *
- * @unittest 1675
+ * @param[in,out] u               URL handle receiving user, password and
+ *                                options; u->scheme (if set) selects the
+ *                                scheme handler.
+ * @param[in]     login           Start of the authority (not necessarily
+ *                                NUL-terminated).
+ * @param[in]     len             Length of @p login in bytes.
+ * @param[in]     flags           CURLU_* flags (CURLU_DISALLOW_USER,
+ *                                CURLU_ALLOW_SPACE).
+ * @param[out]    hostname_offset Offset in @p login where the hostname
+ *                                starts (0 if there is no at-sign).
+ * @return CURLUE_OK on success, also when no login info is present.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @return CURLUE_USER_NOT_ALLOWED if CURLU_DISALLOW_USER is set and a user
+ *         name is present.
+ * @return CURLUE_BAD_USER or CURLUE_BAD_PASSWORD on forbidden bytes.
+ * @return CURLUE_MALFORMED_INPUT on forbidden bytes in the options.
+ * @warning The password is securely wiped before it is freed.
+ * @note Unit tested by unit test 1675.
  */
 UNITTEST CURLUcode parse_hostname_login(struct Curl_URL *u,
                                         const char *login,
@@ -379,7 +536,28 @@ out:
   return ures;
 }
 
-/* @unittest 1653 */
+/**
+ * @brief Split an optional port number off a hostname buffer.
+ * @internal
+ *
+ * Handles both "host:port" and RFC 2732 style "[v6addr]:port". The host
+ * buffer is truncated so it ends before the colon, and u->portnum and
+ * u->port_present are set. A colon with no digits after it is ignored (the
+ * default port is used) to match Firefox, Chrome and Safari, but only if the
+ * URL has a scheme; without one it is an error so that something looking
+ * like a scheme does not work.
+ *
+ * @param[in,out] u          URL handle receiving the port.
+ * @param[in,out] host       Host buffer, trimmed in place to the name only.
+ * @param[in]     has_scheme TRUE if the URL has (or was given) a scheme.
+ * @return CURLUE_OK on success (including no port).
+ * @return CURLUE_BAD_IPV6 if a leading '[' has no closing ']'.
+ * @return CURLUE_BAD_PORT_NUMBER for a malformed or out of range (> 65535)
+ *         port, or garbage after a bracketed address.
+ * @return CURLUE_BACKSLASH if a backslash follows the colon or the port.
+ * @post u->portnum is 0 and u->port_present FALSE unless a port was parsed.
+ * @note Unit tested by unit test 1653.
+ */
 UNITTEST CURLUcode parse_port(struct Curl_URL *u, struct dynbuf *host,
                               bool has_scheme);
 UNITTEST CURLUcode parse_port(struct Curl_URL *u, struct dynbuf *host,
@@ -440,9 +618,15 @@ UNITTEST CURLUcode parse_port(struct Curl_URL *u, struct dynbuf *host,
   return CURLUE_OK;
 }
 
-/* characters not allowed in hostnames:
-   " \r\n\t/:#?!@{}[]\\$\'\"^`*<>=;,+&()%|" */
-
+/**
+ * @brief Lookup table of bytes that are invalid in a hostname.
+ *
+ * Indexed by the byte value; a non-zero entry marks a byte that must not
+ * appear in a hostname. All control bytes are rejected, as are space and
+ * these characters: / : # ? ! @ { } [ ] \ $ ' " ^ ` * < > = ; , + & ( ) %
+ * and |. Bytes >= 0x80 are outside the table and must be checked by the
+ * caller if relevant.
+ */
 static const bool invalid_host_char[256] = {
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 0x00-0x0F */
   1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 0x10-0x1F */
@@ -454,10 +638,24 @@ static const bool invalid_host_char[256] = {
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 1  /* 0x70-0x7F */
 };
 
-/* This function assumes 'hostname' now starts with [. It trims 'hostname' in
- * place and it sets u->zoneid if present.
+/**
+ * @brief Validate and normalize a bracketed IPv6 address in place.
+ * @internal
  *
- * @unittest 1675
+ * Assumes @p hostname starts with '['. Checks that only valid IPv6
+ * characters are used, extracts an optional "%zoneid" into u->zoneid,
+ * and rewrites the address in its canonical compressed text form. The
+ * buffer is only ever shortened.
+ *
+ * @param[in,out] u        URL handle; u->zoneid is set if a zone id exists.
+ * @param[in,out] hostname Host text starting with '[', modified in place.
+ * @param[in]     hlen     Length of @p hostname in bytes.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_IPV6 for a too short, malformed or unparsable address
+ *         or a bad zone id.
+ * @return CURLUE_OUT_OF_MEMORY if the zone id cannot be allocated.
+ * @pre *hostname == '['.
+ * @note Unit tested by unit test 1675.
  */
 UNITTEST CURLUcode ipv6_parse(struct Curl_URL *u, char *hostname,
                               size_t hlen);
@@ -513,7 +711,18 @@ UNITTEST CURLUcode ipv6_parse(struct Curl_URL *u, char *hostname,
   return CURLUE_OK;
 }
 
-/* the input is a confirmed hostname, never an IPv6 address */
+/**
+ * @brief Check that a name is a syntactically acceptable hostname.
+ *
+ * Rejects any byte flagged in invalid_host_char, more than one trailing
+ * dot, and a single lone dot.
+ *
+ * @param[in] hostname Hostname text (need not be NUL-terminated).
+ * @param[in] hlen     Length of @p hostname in bytes.
+ * @return CURLUE_OK if the name is acceptable.
+ * @return CURLUE_BAD_HOSTNAME otherwise.
+ * @pre The input is a confirmed hostname, never an IPv6 address.
+ */
 CURLUcode Curl_hostname_check(const char *hostname, size_t hlen)
 {
   size_t i;
@@ -531,7 +740,17 @@ CURLUcode Curl_hostname_check(const char *hostname, size_t hlen)
   return CURLUE_OK;
 }
 
-/* the input is a hostname or perhaps an IPv6 address */
+/**
+ * @brief Check a hostname that may also be an IPv6 address.
+ * @internal
+ *
+ * @param[in,out] u        URL handle (receives the zone id for IPv6).
+ * @param[in,out] hostname Host text, possibly '['-prefixed.
+ * @param[in]     hlen     Length of @p hostname in bytes.
+ * @return CURLUE_NO_HOST if @p hlen is zero.
+ * @return The result of ipv6_parse() for a '[' prefixed name.
+ * @return Otherwise the result of Curl_hostname_check().
+ */
 static CURLUcode hostname_check6(struct Curl_URL *u, char *hostname,
                                  size_t hlen) /* length of hostname */
 {
@@ -545,22 +764,24 @@ static CURLUcode hostname_check6(struct Curl_URL *u, char *hostname,
   return Curl_hostname_check(hostname, hlen);
 }
 
-/*
- * Handle partial IPv4 numerical addresses and different bases, like
- * '16843009', '0x7f', '0x7f.1' '0177.1.1.1' etc.
+/**
+ * @brief Normalize a numerical IPv4 host to plain dotted decimal.
+ * @internal
  *
- * If the given input string is syntactically wrong IPv4 or any part for
- * example is too big, this function returns HOST_NAME.
+ * Handles partial IPv4 numerical addresses and different bases, like
+ * "16843009", "0x7f", "0x7f.1" and "0177.1.1.1". The normalized version of
+ * the input replaces the buffer content as four decimal integers. A single
+ * dot following the numerical address is accepted and swallowed as if it
+ * was never there.
  *
- * Output the "normalized" version of that input string in plain quad decimal
- * integers.
+ * If the input is syntactically wrong as IPv4, or any part is too big,
+ * the buffer is left alone and HOST_NAME is returned.
  *
- * A single dot following the numerical address is accepted and "swallowed" as
- * if it was never there.
- *
- * Returns the host type.
- *
- * @unittest 1675
+ * @param[in,out] host Host buffer; rewritten on HOST_IPV4.
+ * @return HOST_NAME if the input is not a numerical IPv4 address.
+ * @return HOST_IPV4 if it was and the buffer was normalized.
+ * @return HOST_ERROR on out of memory.
+ * @note Unit tested by unit test 1675.
  */
 UNITTEST int ipv4_normalize(struct dynbuf *host);
 UNITTEST int ipv4_normalize(struct dynbuf *host)
@@ -577,6 +798,7 @@ UNITTEST int ipv4_normalize(struct dynbuf *host)
   while(!done) {
     int rc;
     curl_off_t l;
+    /* Parse one component, honoring 0x (hex) and leading 0 (octal). */
     if(*c == '0') {
       if((c[1] | 0x20) == 'x') {
         c += 2; /* skip the prefix */
@@ -621,6 +843,8 @@ UNITTEST int ipv4_normalize(struct dynbuf *host)
     }
   }
 
+  /* Re-assemble according to how many components were given: the last
+     component fills all the remaining bytes. */
   switch(n) {
   case 0: /* a -- 32 bits */
     curlx_dyn_reset(host);
@@ -668,7 +892,18 @@ UNITTEST int ipv4_normalize(struct dynbuf *host)
   return HOST_IPV4;
 }
 
-/* if necessary, replace the host content with a URL decoded version */
+/**
+ * @brief Replace the host content with its URL decoded version if needed.
+ * @internal
+ *
+ * Does nothing if the host holds no '%'. Control bytes in the decoded
+ * result are rejected.
+ *
+ * @param[in,out] host Host buffer, replaced in place when decoded.
+ * @return CURLUE_OK on success or when nothing needed decoding.
+ * @return CURLUE_BAD_HOSTNAME if decoding fails or yields control bytes.
+ * @return CURLUE_TOO_LARGE or CURLUE_OUT_OF_MEMORY on buffer errors.
+ */
 static CURLUcode urldecode_host(struct dynbuf *host)
 {
   const char *per;
@@ -695,6 +930,27 @@ static CURLUcode urldecode_host(struct dynbuf *host)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Parse an authority: login, host and port.
+ * @internal
+ *
+ * Strips user, password and options (see parse_hostname_login()), appends
+ * the hostname to @p host, splits off the port, URL-decodes the name and
+ * validates it as an IPv6 address, normalized IPv4 address or hostname.
+ *
+ * @param[in,out] u          URL handle receiving login and port data.
+ * @param[in]     auth       Authority text (not NUL-terminated).
+ * @param[in]     authlen    Length of @p auth in bytes.
+ * @param[in]     flags      CURLU_* flags.
+ * @param[in,out] host       Initialized dynbuf that receives the hostname.
+ * @param[in]     has_scheme TRUE if the URL has a scheme.
+ * @return CURLUE_OK on success, otherwise the error from the failing step:
+ *         CURLUE_NO_HOST, CURLUE_BAD_HOSTNAME, CURLUE_BAD_IPV6,
+ *         CURLUE_BAD_PORT_NUMBER, CURLUE_OUT_OF_MEMORY, or any code from
+ *         parse_hostname_login().
+ * @note A missing host takes precedence over port number problems.
+ * @warning The caller owns and must free @p host even on error.
+ */
 static CURLUcode parse_authority(struct Curl_URL *u,
                                  const char *auth, size_t authlen,
                                  unsigned int flags,
@@ -743,7 +999,18 @@ static CURLUcode parse_authority(struct Curl_URL *u,
   return uc;
 }
 
-/* used for HTTP/2 server push */
+/**
+ * @brief Set the host (and port) of a handle from an authority string.
+ *
+ * Used for HTTP/2 server push, where the pushed request carries an
+ * ":authority" value. User info is not allowed in the authority.
+ *
+ * @param[in,out] u         URL handle; its host is replaced on success.
+ * @param[in]     authority NUL-terminated "host[:port]" string.
+ * @return CURLUE_OK on success.
+ * @return Otherwise the parse error, see parse_authority().
+ * @post On success u->host owns the new hostname buffer.
+ */
 CURLUcode Curl_url_set_authority(CURLU *u, const char *authority)
 {
   CURLUcode ures;
@@ -763,9 +1030,17 @@ CURLUcode Curl_url_set_authority(CURLU *u, const char *authority)
   return ures;
 }
 
-/*
- * "Remove Dot Segments"
- * https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4
+/**
+ * @brief Test for a "." path segment character, also as "%2e".
+ *
+ * Part of the "Remove Dot Segments" algorithm
+ * (https://datatracker.ietf.org/doc/html/rfc3986#section-5.2.4).
+ * If a dot (or its percent-encoded form, case-insensitive) is at the
+ * front, the string pointer and length are advanced past it.
+ *
+ * @param[in,out] str  Current position; advanced by 1 or 3 on a match.
+ * @param[in,out] clen Remaining length; decreased accordingly.
+ * @return TRUE if a dot was consumed, FALSE otherwise (nothing changed).
  */
 
 static bool is_dot(const char **str, size_t *clen)
@@ -785,9 +1060,21 @@ static bool is_dot(const char **str, size_t *clen)
   return FALSE;
 }
 
+/**
+ * @def ISSLASH
+ * @brief Test whether a character is the path separator '/'.
+ */
 #define ISSLASH(x) ((x) == '/')
 
-/* prescan the string to see if it needs work */
+/**
+ * @brief Prescan a path to see if dot segment removal is needed.
+ * @internal
+ *
+ * @param[in] p  Path bytes.
+ * @param[in] pn Length of the path.
+ * @return TRUE if the path contains a "." or ".." segment (also in
+ *         percent-encoded form), FALSE if it can be used unchanged.
+ */
 static bool needs_dedotdot(const char *p, size_t pn)
 {
   /* a single byte path cannot be cleaned up */
@@ -812,21 +1099,20 @@ static bool needs_dedotdot(const char *p, size_t pn)
   return FALSE;
 }
 
-/*
- * dedotdotify()
+/**
+ * @brief Remove "." and ".." segments from a path (RFC 3986 5.2.4).
  *
- * This function gets a null-terminated path with dot and dotdot sequences
- * passed in and strips them off according to the rules in RFC 3986 section
- * 5.2.4.
+ * Takes a path with dot and dotdot sequences and strips them according to
+ * the rules in RFC 3986 section 5.2.4. The function handles a path only;
+ * it must not contain the query or fragment.
  *
- * The function handles a path. It should not contain the query nor fragment.
- *
- * RETURNS
- *
- * Zero for success and 'out' set to an allocated string (or NULL if there's
- * nothing to do).
- *
- * @unittest 1395
+ * @param[in]  input Path bytes.
+ * @param[in]  clen  Length of @p input in bytes.
+ * @param[out] outp  Set to a newly allocated, NUL-terminated cleaned path,
+ *                   or to NULL if the path needed no change.
+ * @return 0 on success. 1 on out of memory.
+ * @note Unit tested by unit test 1395.
+ * @warning The caller owns the string returned in @p outp and must free it.
  */
 UNITTEST int dedotdotify(const char *input, size_t clen, char **outp);
 UNITTEST int dedotdotify(const char *input, size_t clen, char **outp)
@@ -937,8 +1223,26 @@ end:
   return result ? 1 : 0; /* success */
 }
 
-/*
- * @unittest 1675
+/**
+ * @brief Parse a "file:" URL and find its path.
+ * @internal
+ *
+ * Validates the form per RFC 8089. An authority is accepted only if it is
+ * empty, "localhost" or "127.0.0.1" (a Windows drive letter is also fine
+ * on Windows). On non-Windows systems drive letters are refused. On success
+ * the scheme is stored as "file".
+ *
+ * @param[in]     url      The complete NUL-terminated URL.
+ * @param[in]     urllen   Length of @p url.
+ * @param[in,out] u        URL handle; its scheme is set to "file".
+ * @param[out]    pathp    Points into @p url at the start of the path.
+ * @param[out]    pathlenp Length of the path including query and fragment.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_FILE_URL for a too short URL, a path not starting
+ *         with '/', a disallowed host or an unsupported drive letter.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @note @p pathp is not allocated; it only references @p url.
+ * @note Unit tested by unit test 1675.
  */
 UNITTEST CURLUcode parse_file(const char *url, size_t urllen, CURLU *u,
                               const char **pathp, size_t *pathlenp);
@@ -1032,6 +1336,30 @@ UNITTEST CURLUcode parse_file(const char *url, size_t urllen, CURLU *u,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Validate the scheme and locate where the authority starts.
+ * @internal
+ *
+ * For a URL with a scheme, checks it is supported (unless
+ * CURLU_NON_SUPPORT_SCHEME), skips the slashes after the colon and stores
+ * the scheme in the handle. Without a scheme it fails unless
+ * CURLU_DEFAULT_SCHEME or CURLU_GUESS_SCHEME is set; the default scheme is
+ * stored only for CURLU_DEFAULT_SCHEME.
+ *
+ * @param[in]     url       The complete URL.
+ * @param[in,out] u         URL handle receiving the scheme.
+ * @param[in]     schemebuf Lowercased scheme, as found by
+ *                          Curl_is_absolute_url().
+ * @param[in]     schemelen Length of the scheme, 0 if none was found.
+ * @param[in]     flags     CURLU_* flags.
+ * @param[out]    hostpp    Set to where the hostname starts in @p url.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_UNSUPPORTED_SCHEME for an unknown scheme.
+ * @return CURLUE_BAD_SLASHES for a bad number of slashes.
+ * @return CURLUE_BAD_SCHEME if no scheme is present and none may be
+ *         guessed or defaulted.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ */
 static CURLUcode parse_scheme(const char *url, CURLU *u, char *schemebuf,
                               size_t schemelen, unsigned int flags,
                               const char **hostpp)
@@ -1090,6 +1418,19 @@ static CURLUcode parse_scheme(const char *url, CURLU *u, char *schemebuf,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Guess the scheme from the start of the hostname.
+ * @internal
+ *
+ * Legacy curl behavior: "ftp.", "dict.", "ldap.", "imap.", "smtp." and
+ * "pop3." prefixes select that protocol, anything else gets "http". The
+ * handle is marked as having a guessed scheme.
+ *
+ * @param[in,out] u    URL handle; scheme and guessed_scheme are set.
+ * @param[in]     host Host buffer inspected.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ */
 static CURLUcode guess_scheme(CURLU *u, struct dynbuf *host)
 {
   const char *hostname = curlx_dyn_ptr(host);
@@ -1118,6 +1459,20 @@ static CURLUcode guess_scheme(CURLU *u, struct dynbuf *host)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Store the fragment of a URL being parsed.
+ * @internal
+ *
+ * @param[in,out] u        URL handle receiving the fragment.
+ * @param[in]     fragment Points at the leading '#'.
+ * @param[in]     fraglen  Length including the '#'.
+ * @param[in]     flags    CURLU_* flags (CURLU_URLENCODE, CURLU_ALLOW_SPACE).
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_FRAGMENT on forbidden bytes.
+ * @return CURLUE_OUT_OF_MEMORY or the encoder error otherwise.
+ * @post u->fragment_present is TRUE; u->fragment stays NULL for an empty
+ *       fragment ("#" alone).
+ */
 static CURLUcode handle_fragment(CURLU *u, const char *fragment,
                                  size_t fraglen, unsigned int flags)
 {
@@ -1144,6 +1499,19 @@ static CURLUcode handle_fragment(CURLU *u, const char *fragment,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Store the query of a URL being parsed.
+ * @internal
+ *
+ * @param[in,out] u     URL handle receiving the query.
+ * @param[in]     query Points at the leading '?'.
+ * @param[in]     qlen  Length including the '?'.
+ * @param[in]     flags CURLU_* flags (CURLU_URLENCODE, CURLU_ALLOW_SPACE).
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_QUERY on forbidden bytes.
+ * @return CURLUE_OUT_OF_MEMORY or the encoder error otherwise.
+ * @post u->query_present is TRUE; a lone '?' stores an empty string.
+ */
 static CURLUcode handle_query(CURLU *u, const char *query,
                               size_t qlen, unsigned int flags)
 {
@@ -1177,6 +1545,24 @@ static CURLUcode handle_query(CURLU *u, const char *query,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Store the path of a URL being parsed.
+ * @internal
+ *
+ * Optionally URL-encodes it, checks for forbidden bytes and removes dot
+ * segments unless CURLU_PATH_AS_IS is set.
+ *
+ * @param[in,out] u       URL handle receiving the path.
+ * @param[in]     path    Path bytes (query and fragment already removed).
+ * @param[in]     pathlen Length of @p path.
+ * @param[in]     flags   CURLU_* flags.
+ * @param[in]     is_file TRUE for file: URLs, where a one byte path ("/")
+ *                        is stored; other schemes need at least two bytes,
+ *                        a lone "/" is the same as no path.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_PATH on forbidden bytes.
+ * @return CURLUE_OUT_OF_MEMORY or the encoder error otherwise.
+ */
 static CURLUcode handle_path(CURLU *u, const char *path,
                              size_t pathlen, unsigned int flags,
                              bool is_file)
@@ -1222,6 +1608,22 @@ static CURLUcode handle_path(CURLU *u, const char *path,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Parse a complete URL string into a handle.
+ * @internal
+ *
+ * Splits the URL into scheme, authority, path, query and fragment and
+ * stores the pieces in @p u. Handles file: URLs separately.
+ *
+ * @param[in]     url   NUL-terminated URL, at most CURL_MAX_INPUT_LENGTH.
+ * @param[in,out] u     URL handle to fill; expected to be empty.
+ * @param[in]     flags CURLU_* flags.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_MALFORMED_INPUT if the URL is too long.
+ * @return Any error of the sub parsers (CURLUE_NO_HOST,
+ *         CURLUE_BAD_SCHEME, CURLUE_BAD_HOSTNAME, ...).
+ * @post On failure @p u is cleared of all allocated members.
+ */
 static CURLUcode parseurl(const char *url, CURLU *u, unsigned int flags)
 {
   const char *path;
@@ -1312,8 +1714,18 @@ fail:
   return ures;
 }
 
-/*
- * Parse the URL and, if successful, replace everything in the Curl_URL struct.
+/**
+ * @brief Parse a URL and, if successful, replace the handle content.
+ * @internal
+ *
+ * The URL is parsed into a temporary handle so the existing content is
+ * kept intact if parsing fails.
+ *
+ * @param[in]     url   NUL-terminated URL to parse.
+ * @param[in,out] u     URL handle; replaced entirely on success.
+ * @param[in]     flags CURLU_* flags.
+ * @return CURLUE_OK on success, otherwise the error from parseurl().
+ * @post On failure @p u is unchanged.
  */
 static CURLUcode parseurl_and_replace(const char *url, CURLU *u,
                                       unsigned int flags)
@@ -1329,8 +1741,23 @@ static CURLUcode parseurl_and_replace(const char *url, CURLU *u,
   return ures;
 }
 
-/*
- * Concatenate a relative URL onto a base URL making it absolute.
+/**
+ * @brief Resolve a relative URL against a base URL.
+ * @internal
+ *
+ * Concatenates the relative reference onto the base, making it absolute,
+ * and parses the result into @p u. Supports protocol-relative ("//host"),
+ * absolute-path ("/path"), fragment-only ("#frag"), query-only ("?q")
+ * and relative-path references.
+ *
+ * @param[in]     base   Complete, NUL-terminated base URL.
+ * @param[in]     relurl The relative reference.
+ * @param[in,out] u      URL handle receiving the result.
+ * @param[in]     flags  CURLU_* flags (CURLU_PATH_AS_IS is dropped as the
+ *                       base is merged then normalized).
+ * @return CURLUE_OK on success.
+ * @return CURLUE_MALFORMED_INPUT if @p base is NULL.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure or the parse error.
  */
 static CURLUcode redirect_url(const char *base, const char *relurl,
                               CURLU *u, unsigned int flags)
@@ -1408,13 +1835,28 @@ static CURLUcode redirect_url(const char *base, const char *relurl,
   return uc;
 }
 
-/*
+/**
+ * @brief Create a new, empty URL handle.
+ * @ingroup urlapi
+ *
+ * @return A new CURLU handle, or NULL on out of memory.
+ * @warning Release with curl_url_cleanup(); the handle is not
+ *          thread-safe.
+ * @see curl_url_cleanup(), curl_url_dup()
  */
 CURLU *curl_url(void)
 {
   return curlx_calloc(1, sizeof(struct Curl_URL));
 }
 
+/**
+ * @brief Free a URL handle and all of its content.
+ * @ingroup urlapi
+ *
+ * @param[in] u Handle to free. NULL is allowed and does nothing.
+ * @post The handle and the strings it owns are invalid.
+ * @see curl_url()
+ */
 void curl_url_cleanup(CURLU *u)
 {
   if(u) {
@@ -1423,6 +1865,16 @@ void curl_url_cleanup(CURLU *u)
   }
 }
 
+/**
+ * @def DUP
+ * @brief Duplicate one string member from @p src to @p dest.
+ *
+ * @param dest Destination CURLU pointer.
+ * @param src  Source CURLU pointer.
+ * @param name Member name to copy.
+ * @warning Jumps to the label "fail" on allocation failure; the using
+ *          function must define it.
+ */
 #define DUP(dest, src, name)                    \
   do {                                          \
     if((src)->name) {                           \
@@ -1432,6 +1884,15 @@ void curl_url_cleanup(CURLU *u)
     }                                           \
   } while(0)
 
+/**
+ * @brief Make a deep copy of a URL handle.
+ * @ingroup urlapi
+ *
+ * @param[in] in Handle to duplicate; may be NULL.
+ * @return A new independent handle, or NULL if @p in is NULL or memory
+ *         ran out.
+ * @post The caller owns the copy and must call curl_url_cleanup().
+ */
 CURLU *curl_url_dup(const CURLU *in)
 {
   struct Curl_URL *u;
@@ -1462,10 +1923,28 @@ fail:
   return NULL;
 }
 
+/**
+ * @def host_decode
+ * @def host_encode
+ * @brief Convert a hostname to/from IDN, or report CURLUE_LACKS_IDN.
+ *
+ * Without IDN support both resolve to CURLUE_LACKS_IDN.
+ */
 #ifndef USE_IDN
 #define host_decode(x, y) CURLUE_LACKS_IDN
 #define host_encode(x, y) CURLUE_LACKS_IDN
 #else
+/**
+ * @brief Convert a punycode hostname into its IDN (UTF-8) form.
+ * @internal
+ *
+ * @param[in]  host      ASCII (punycode) hostname.
+ * @param[out] allochost Newly allocated converted name on success.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_OUT_OF_MEMORY on out of memory.
+ * @return CURLUE_BAD_HOSTNAME if the conversion fails.
+ * @warning The caller must free @p allochost.
+ */
 static CURLUcode host_decode(const char *host, char **allochost)
 {
   CURLcode result = Curl_idn_decode(host, allochost);
@@ -1475,6 +1954,17 @@ static CURLUcode host_decode(const char *host, char **allochost)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Convert an IDN (UTF-8) hostname into its punycode form.
+ * @internal
+ *
+ * @param[in]  host      Non-ASCII hostname.
+ * @param[out] allochost Newly allocated converted name on success.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_OUT_OF_MEMORY on out of memory.
+ * @return CURLUE_BAD_HOSTNAME if the conversion fails.
+ * @warning The caller must free @p allochost.
+ */
 static CURLUcode host_encode(const char *host, char **allochost)
 {
   CURLcode result = Curl_idn_encode(host, allochost);
@@ -1485,6 +1975,27 @@ static CURLUcode host_encode(const char *host, char **allochost)
 }
 #endif
 
+/**
+ * @brief Produce an output copy of a URL part, applying get-flags.
+ * @internal
+ *
+ * Duplicates @p ptr and applies the transformations requested by the flags:
+ * '+' to space for queries, URL decode, URL encode, or punycode/IDN
+ * conversion of the host.
+ *
+ * @param[in]  u          URL handle (the host is used for the IDN test).
+ * @param[in]  what       The part being fetched.
+ * @param[in]  ptr        The stored part content.
+ * @param[out] partp      Receives a newly allocated string (NULL on error).
+ * @param[in]  plusdecode TRUE to convert '+' to ' ' (query decode).
+ * @param[in]  flags      CURLU_URLDECODE, CURLU_URLENCODE,
+ *                        CURLU_PUNYCODE and CURLU_PUNY2IDN are used.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_URLDECODE if decoding fails or yields control bytes.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @return CURLUE_LACKS_IDN or CURLUE_BAD_HOSTNAME for IDN problems.
+ * @warning The caller owns the string stored in @p partp.
+ */
 static CURLUcode urlget_format(const CURLU *u, CURLUPart what,
                                const char *ptr, char **partp,
                                bool plusdecode, unsigned int flags)
@@ -1558,6 +2069,17 @@ static CURLUcode urlget_format(const CURLU *u, CURLUPart what,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Build a "file://" URL string from the handle.
+ * @internal
+ *
+ * @param[in]  u           URL handle.
+ * @param[out] part        Receives the allocated URL.
+ * @param[in]  fragmentsep "#" or "" separator before the fragment.
+ * @param[in]  querysep    "?" or "" separator before the query.
+ * @return CURLUE_OK, or CURLUE_OUT_OF_MEMORY.
+ * @warning The caller must free the string stored in @p part.
+ */
 static CURLUcode file_url(const CURLU *u, char **part,
                           const char *fragmentsep,
                           const char *querysep)
@@ -1573,6 +2095,23 @@ static CURLUcode file_url(const CURLU *u, char **part,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Assemble the complete URL string from the stored parts.
+ * @internal
+ *
+ * Applies CURLU_DEFAULT_SCHEME, CURLU_DEFAULT_PORT, CURLU_NO_DEFAULT_PORT,
+ * CURLU_NO_GUESS_SCHEME, CURLU_GET_EMPTY, CURLU_URLENCODE, CURLU_PUNYCODE
+ * and CURLU_PUNY2IDN. An IPv6 zone id is written as "%25zone".
+ *
+ * @param[in]  u     URL handle.
+ * @param[out] part  Receives the allocated URL.
+ * @param[in]  flags CURLU_* flags.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_NO_HOST if there is no host (and not a file: URL).
+ * @return CURLUE_NO_SCHEME if there is no scheme and no default allowed.
+ * @return CURLUE_OUT_OF_MEMORY or an IDN/host error otherwise.
+ * @warning The caller must free the string stored in @p part.
+ */
 static CURLUcode urlget_url(const CURLU *u, char **part, unsigned int flags)
 {
   char *url;
@@ -1690,6 +2229,34 @@ static CURLUcode urlget_url(const CURLU *u, char **part, unsigned int flags)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Extract a part of the URL in a handle.
+ * @ingroup urlapi
+ *
+ * Returns a newly allocated copy of the requested component. The meaning
+ * of @p flags is documented in the public libcurl-url man page.
+ *
+ * @param[in]  u     URL handle.
+ * @param[in]  what  The part to extract (CURLUPART_*).
+ * @param[out] part  Receives an allocated string on success, NULL
+ *                   otherwise.
+ * @param[in]  flags CURLU_* flags (CURLU_DEFAULT_PORT,
+ *                   CURLU_NO_DEFAULT_PORT, CURLU_DEFAULT_SCHEME,
+ *                   CURLU_NO_GUESS_SCHEME, CURLU_GET_EMPTY,
+ *                   CURLU_URLDECODE, CURLU_URLENCODE, CURLU_PUNYCODE,
+ *                   CURLU_PUNY2IDN).
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_HANDLE if @p u is NULL.
+ * @return CURLUE_BAD_PARTPOINTER if @p part is NULL.
+ * @return CURLUE_UNKNOWN_PART for an unknown @p what.
+ * @return CURLUE_NO_SCHEME, CURLUE_NO_USER, CURLUE_NO_PASSWORD,
+ *         CURLUE_NO_OPTIONS, CURLUE_NO_HOST, CURLUE_NO_ZONEID,
+ *         CURLUE_NO_PORT, CURLUE_NO_QUERY or CURLUE_NO_FRAGMENT when the
+ *         requested part is not present.
+ * @return CURLUE_OUT_OF_MEMORY or a conversion error otherwise.
+ * @warning The returned string must be released with curl_free().
+ * @see curl_url_set()
+ */
 CURLUcode curl_url_get(const CURLU *u, CURLUPart what,
                        char **part, unsigned int flags)
 {
@@ -1703,6 +2270,8 @@ CURLUcode curl_url_get(const CURLU *u, CURLUPart what,
     return CURLUE_BAD_PARTPOINTER;
   *part = NULL;
 
+  /* Select the stored member for the requested part and what to report
+     if it is not present. */
   switch(what) {
   case CURLUPART_SCHEME:
     ptr = u->scheme;
@@ -1791,6 +2360,18 @@ CURLUcode curl_url_get(const CURLU *u, CURLUPart what,
   return ifmissing;
 }
 
+/**
+ * @brief Validate a scheme string supplied to curl_url_set().
+ * @internal
+ *
+ * @param[in,out] u      URL handle; guessed_scheme is cleared on success.
+ * @param[in]     scheme The new scheme.
+ * @param[in]     flags  CURLU_NON_SUPPORT_SCHEME allows schemes without a
+ *                       protocol handler.
+ * @return CURLUE_OK if acceptable.
+ * @return CURLUE_BAD_SCHEME if empty, too long or has illegal characters.
+ * @return CURLUE_UNSUPPORTED_SCHEME for an unknown scheme unless allowed.
+ */
 static CURLUcode set_url_scheme(CURLU *u, const char *scheme,
                                 unsigned int flags)
 {
@@ -1822,6 +2403,15 @@ static CURLUcode set_url_scheme(CURLU *u, const char *scheme,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Parse and store a port number given as a string.
+ * @internal
+ *
+ * @param[in,out] u             URL handle receiving the port.
+ * @param[in]     provided_port Decimal digits only, at most 65535.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_PORT_NUMBER if not a plain decimal number in range.
+ */
 static CURLUcode set_url_port(CURLU *u, const char *provided_port)
 {
   curl_off_t port;
@@ -1836,6 +2426,24 @@ static CURLUcode set_url_port(CURLU *u, const char *provided_port)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Set the whole URL from a string (CURLUPART_URL).
+ * @internal
+ *
+ * An absolute URL replaces the existing content. A relative URL is
+ * resolved against the URL currently stored in the handle (if complete),
+ * following RFC 3986 section 5.2. An empty string is only accepted when a
+ * complete URL is already held, and then it just drops the fragment.
+ *
+ * @param[in,out] u         URL handle.
+ * @param[in]     url       The new URL or relative reference.
+ * @param[in]     part_size Length of @p url.
+ * @param[in]     flags     CURLU_* flags.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_MALFORMED_INPUT for a blank URL on an incomplete handle.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @return Otherwise a parse error.
+ */
 static CURLUcode set_url(CURLU *u, const char *url, size_t part_size,
                          unsigned int flags)
 {
@@ -1890,6 +2498,16 @@ static CURLUcode set_url(CURLU *u, const char *url, size_t part_size,
   return uc;
 }
 
+/**
+ * @brief Clear one component of the handle (set to NULL).
+ * @internal
+ *
+ * CURLUPART_URL clears everything. The password is wiped before freeing.
+ *
+ * @param[in,out] u    URL handle.
+ * @param[in]     what Part to clear.
+ * @return CURLUE_OK on success, CURLUE_UNKNOWN_PART for an invalid part.
+ */
 static CURLUcode urlset_clear(CURLU *u, CURLUPart what)
 {
   switch(what) {
@@ -1938,6 +2556,15 @@ static CURLUcode urlset_clear(CURLU *u, CURLUPart what)
   return CURLUE_OK;
 }
 
+/**
+ * @brief Tell whether a byte may appear unencoded in a URL path.
+ * @internal
+ *
+ * These are the RFC 3986 sub-delims plus ':', at-sign and '/'.
+ *
+ * @param[in] x The byte to test.
+ * @return TRUE if allowed as-is in a path, else FALSE.
+ */
 static bool allowed_in_path(unsigned char x)
 {
   switch(x) {
@@ -1964,6 +2591,21 @@ static bool allowed_in_path(unsigned char x)
   return FALSE;
 }
 
+/**
+ * @brief Percent-encode a string for use in a URL part.
+ * @internal
+ *
+ * Unreserved characters are kept. Other bytes become %XX, except that
+ * a space becomes '+' when @p plusencode is set, path-allowed characters are
+ * kept in path mode, and the first '=' is kept when @p equalsencode is set.
+ *
+ * @param[in,out] encp         Output buffer; encoded data is appended.
+ * @param[in]     part         NUL-terminated input.
+ * @param[in]     plusencode   Encode space as '+'.
+ * @param[in]     pathmode     Keep characters allowed in a path.
+ * @param[in]     equalsencode Keep the first '=' (query append mode).
+ * @return CURLUE_OK, CURLUE_TOO_LARGE or CURLUE_OUT_OF_MEMORY.
+ */
 static CURLUcode url_encode_part(struct dynbuf *encp,
                                  const char *part,
                                  bool plusencode,
@@ -1995,6 +2637,15 @@ static CURLUcode url_encode_part(struct dynbuf *encp,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Copy a string, uppercasing the hex of percent sequences.
+ * @internal
+ *
+ * @param[in,out] encp Output buffer; the string is appended and
+ *                     normalized in place.
+ * @param[in]     part NUL-terminated input.
+ * @return CURLUE_OK, CURLUE_TOO_LARGE or CURLUE_OUT_OF_MEMORY.
+ */
 static CURLUcode url_uppercasehex_part(struct dynbuf *encp,
                                        const char *part)
 {
@@ -2017,6 +2668,19 @@ static CURLUcode url_uppercasehex_part(struct dynbuf *encp,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Append a new query part to the existing query.
+ * @internal
+ *
+ * Adds '&' between the old and new data unless the old query already ends
+ * with one. Used for CURLU_APPENDQUERY.
+ *
+ * @param[in,out] u    URL handle whose query is replaced by the result.
+ * @param[in,out] encp Encoded data to append; ownership moves to the
+ *                     handle on success, freed on failure.
+ * @return CURLUE_OK, CURLUE_TOO_LARGE or CURLUE_OUT_OF_MEMORY.
+ * @post @p encp must no longer be freed or used by the caller on success.
+ */
 static CURLUcode url_append_query(CURLU *u, struct dynbuf *encp)
 {
   /* Append the 'encp' string onto the old query. Add a '&' separator if none
@@ -2055,6 +2719,22 @@ nomem:
   return CURLUE_OK;
 }
 
+/**
+ * @brief Validate and normalize a host being set.
+ * @internal
+ *
+ * An empty host is only accepted with CURLU_NO_AUTHORITY. If the host
+ * was not URL encoded here it is decoded for the check. IPv6 and IPv4
+ * numerical hosts are normalized.
+ *
+ * @param[in,out] u         URL handle (a zone id may be stored).
+ * @param[in,out] encp      Host buffer; may be rewritten. Freed on error.
+ * @param[in]     urlencode TRUE if CURLU_URLENCODE was applied.
+ * @param[in]     flags     CURLU_* flags.
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_HOSTNAME for an invalid host.
+ * @post On error @p encp has been freed.
+ */
 static CURLUcode url_sethost(CURLU *u, struct dynbuf *encp,
                              bool urlencode,
                              unsigned int flags)
@@ -2104,6 +2784,34 @@ static CURLUcode url_sethost(CURLU *u, struct dynbuf *encp,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Set or replace a part of the URL in a handle.
+ * @ingroup urlapi
+ *
+ * Passing NULL as @p part clears the component. The new content is
+ * copied into the handle. With CURLU_URLENCODE the data is encoded;
+ * otherwise percent-encoded hex is just uppercased. The path always gets a
+ * leading slash and the host is validated and normalized.
+ *
+ * @param[in,out] u     URL handle.
+ * @param[in]     what  The part to set (CURLUPART_*).
+ * @param[in]     part  New content, or NULL to clear it.
+ * @param[in]     flags CURLU_* flags (CURLU_URLENCODE, CURLU_APPENDQUERY,
+ *                      CURLU_NON_SUPPORT_SCHEME, CURLU_GUESS_SCHEME,
+ *                      CURLU_DEFAULT_SCHEME, CURLU_NO_AUTHORITY, ...).
+ * @return CURLUE_OK on success.
+ * @return CURLUE_BAD_HANDLE if @p u is NULL.
+ * @return CURLUE_MALFORMED_INPUT if the input is longer than
+ *         CURL_MAX_INPUT_LENGTH.
+ * @return CURLUE_UNKNOWN_PART for an unknown @p what.
+ * @return CURLUE_BAD_PORT_NUMBER, CURLUE_BAD_SCHEME,
+ *         CURLUE_UNSUPPORTED_SCHEME, CURLUE_BAD_HOSTNAME or another
+ *         part-specific error for bad input.
+ * @return CURLUE_OUT_OF_MEMORY on allocation failure.
+ * @warning Not thread-safe for a shared handle. On failure the previous
+ *          content of the part is preserved.
+ * @see curl_url_get()
+ */
 CURLUcode curl_url_set(CURLU *u, CURLUPart what,
                        const char *part, unsigned int flags)
 {
@@ -2127,6 +2835,7 @@ CURLUcode curl_url_set(CURLU *u, CURLUPart what,
     /* excessive input length */
     return CURLUE_MALFORMED_INPUT;
 
+  /* Pick where to store the data and how it must be encoded. */
   switch(what) {
   case CURLUPART_SCHEME: {
     CURLUcode status = set_url_scheme(u, part, flags);
@@ -2175,6 +2884,7 @@ CURLUcode curl_url_set(CURLU *u, CURLUPart what,
   default:
     return CURLUE_UNKNOWN_PART;
   }
+  /* Build the encoded copy and swap it in for the old content. */
   DEBUGASSERT(storep);
   {
     const char *newp = NULL;
@@ -2212,6 +2922,18 @@ CURLUcode curl_url_set(CURLU *u, CURLUPart what,
   return CURLUE_OK;
 }
 
+/**
+ * @brief Check whether two URLs have the same origin.
+ *
+ * Compares scheme, host, port (a default port matches a missing one) and
+ * zone id. Used to decide, for example, whether credentials may be sent on
+ * after a redirect.
+ *
+ * @param[in] base The base URL; must be absolute (scheme and host).
+ * @param[in] href The URL to compare; may be partial.
+ * @return TRUE if @p href is same-origin with @p base, FALSE otherwise.
+ * @note A partial @p href (missing scheme or host) inherits from @p base.
+ */
 bool Curl_url_same_origin(CURLU *base, CURLU *href)
 {
   const struct Curl_scheme *s = NULL;
@@ -2247,6 +2969,14 @@ bool Curl_url_same_origin(CURLU *base, CURLU *href)
   return TRUE;
 }
 
+/**
+ * @brief Get the port of a handle, falling back to the scheme default.
+ *
+ * @param[in]  u     URL handle.
+ * @param[out] pport Receives the port number, 0 if none is available.
+ * @return CURLUE_OK if a port is stored or the scheme has a default.
+ * @return CURLUE_NO_PORT otherwise.
+ */
 CURLUcode Curl_url_get_port(CURLU *u, uint16_t *pport)
 {
   if(u->port_present) {
@@ -2263,3 +2993,5 @@ CURLUcode Curl_url_get_port(CURLU *u, uint16_t *pport)
   *pport = 0;
   return CURLUE_NO_PORT;
 }
+
+/** @} */

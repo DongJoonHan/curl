@@ -21,6 +21,30 @@
  * SPDX-License-Identifier: curl
  *
  ***************************************************************************/
+/**
+ * @file easy.c
+ * @brief Easy interface: global init/cleanup and the curl_easy_* API.
+ *
+ * Implements the public "easy" API of libcurl. It contains the process
+ * wide initialization and cleanup (curl_global_init() and friends), the
+ * creation, duplication, reset and cleanup of easy handles, the blocking
+ * transfer driver curl_easy_perform() (built on a private multi handle),
+ * pause/unpause, connect-only send/receive, connection upkeep, TLS session
+ * import/export and the per-handle meta data store.
+ *
+ * Debug builds additionally contain an event based transfer engine
+ * (curl_easy_perform_ev()) used by the test suite to exercise the
+ * curl_multi_socket_action() code paths.
+ *
+ * @note The easy handle itself is not thread-safe: one handle must not be
+ *       used from several threads at the same time. The global init and
+ *       cleanup functions are only thread-safe when libcurl was built with
+ *       GLOBAL_INIT_IS_THREADSAFE.
+ *
+ * @defgroup easy Easy interface
+ * @brief Public curl_easy_* API and global initialization.
+ * @{
+ */
 #include "curl_setup.h"
 
 #ifdef HAVE_NETINET_IN_H
@@ -80,16 +104,26 @@
 
 #include "easy_lock.h"
 
-/* true globals -- for curl_global_init() and curl_global_cleanup() */
+/**
+ * @name Global initialization state
+ * @brief True globals shared by curl_global_init() and
+ *        curl_global_cleanup().
+ * @{
+ */
+/** Reference count of successful curl_global_init() calls. */
 static unsigned int initialized;
 #ifdef USE_WINSOCK
+/** TRUE if this library called WSAStartup() and must call WSACleanup(). */
 static bool winsock_initialized;
 #endif
 
 #ifdef GLOBAL_INIT_IS_THREADSAFE
 
+/** Lock serializing the global init, cleanup, trace and sslset calls. */
 static curl_simple_lock s_lock = CURL_SIMPLE_LOCK_INIT;
+/** @brief Take the global init lock (no-op without thread-safe init). */
 #define global_init_lock()   curl_simple_lock_lock(&s_lock)
+/** @brief Release the global init lock (no-op without thread-safe init). */
 #define global_init_unlock() curl_simple_lock_unlock(&s_lock)
 
 #else
@@ -104,14 +138,30 @@ static curl_simple_lock s_lock = CURL_SIMPLE_LOCK_INIT;
 #  pragma warning(disable:4232) /* MSVC extension, dllimport identity */
 #endif
 
-/*
+/** @} */
+
+/**
+ * @name Memory function pointers
+ * @brief Allocator callbacks used by all of libcurl.
+ *
  * If a memory-using function (like curl_getenv) is used before
- * curl_global_init() is called, we need to have these pointers set already.
+ * curl_global_init() is called, these pointers must already be set, so
+ * they default to the C library allocators. curl_global_init_mem() can
+ * replace them.
+ *
+ * @warning They are plain globals; replacing them while other threads use
+ *          libcurl is not safe.
+ * @{
  */
+/** malloc replacement. */
 curl_malloc_callback Curl_cmalloc = (curl_malloc_callback)malloc;
+/** free replacement. */
 curl_free_callback Curl_cfree = (curl_free_callback)free;
+/** realloc replacement. */
 curl_realloc_callback Curl_crealloc = (curl_realloc_callback)realloc;
+/** strdup replacement. */
 curl_strdup_callback Curl_cstrdup = (curl_strdup_callback)CURLX_STRDUP_LOW;
+/** calloc replacement. */
 curl_calloc_callback Curl_ccalloc = (curl_calloc_callback)calloc;
 
 #if defined(_MSC_VER) && defined(_DLL)
@@ -119,12 +169,37 @@ curl_calloc_callback Curl_ccalloc = (curl_calloc_callback)calloc;
 #endif
 
 #ifdef DEBUGBUILD
+/** @} */
+
+/**
+ * @brief Debug builds only: deliberate allocation to detect a missing
+ *        curl_global_cleanup() (set when CURL_GLOBAL_INIT is in the
+ *        environment).
+ */
 static char *leakpointer;
 #endif
 
 /**
+ * @internal
+ * @brief Do the actual global initialization of libcurl.
+ *
  * curl_global_init() globally initializes curl given a bitwise set of the
- * different features of what to initialize.
+ * different features of what to initialize. Calls are reference counted:
+ * only the first one does the work, later ones just bump the counter.
+ * On failure the counter increase is undone.
+ *
+ * @param[in] flags        Bitmask of CURL_GLOBAL_* features. Only
+ *                         CURL_GLOBAL_WINSOCK is acted upon here.
+ * @param[in] memoryfuncs  TRUE to reset the memory callbacks to the C
+ *                         library defaults, FALSE to keep user supplied
+ *                         ones (curl_global_init_mem()).
+ *
+ * @return CURLE_OK on success (or when already initialized).
+ * @return CURLE_FAILED_INIT if any sub-system (trace, SSPI, Winsock, TLS,
+ *         hash, QUIC, Amiga, macOS, async resolver, SSH) fails to init.
+ *
+ * @pre The global init lock must be held by the caller.
+ * @see curl_global_init(), curl_global_cleanup()
  */
 static CURLcode global_init(long flags, bool memoryfuncs)
 {
@@ -227,8 +302,20 @@ fail:
 }
 
 /**
+ * @brief Globally initialize libcurl.
+ *
  * curl_global_init() globally initializes curl given a bitwise set of the
- * different features of what to initialize.
+ * different features of what to initialize. It should be called once
+ * before any other libcurl function; every call must be matched by a call
+ * to curl_global_cleanup().
+ *
+ * @param[in] flags  Bitmask of CURL_GLOBAL_* values.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_FAILED_INIT if initialization failed.
+ *
+ * @warning Not thread-safe unless built with GLOBAL_INIT_IS_THREADSAFE.
+ * @see curl_global_init_mem(), curl_global_cleanup()
  */
 CURLcode curl_global_init(long flags)
 {
@@ -242,9 +329,26 @@ CURLcode curl_global_init(long flags)
   return result;
 }
 
-/*
+/**
+ * @brief Globally initialize libcurl and register memory callbacks.
+ *
  * curl_global_init_mem() globally initializes curl and also registers the
- * user provided callback routines.
+ * user provided callback routines. If libcurl is already initialized the
+ * callbacks are ignored, but the reference counter is still incremented so
+ * that the same number of cleanup calls is required.
+ *
+ * @param[in] flags  Bitmask of CURL_GLOBAL_* values.
+ * @param[in] m      malloc replacement, must not be NULL.
+ * @param[in] f      free replacement, must not be NULL.
+ * @param[in] r      realloc replacement, must not be NULL.
+ * @param[in] s      strdup replacement, must not be NULL.
+ * @param[in] c      calloc replacement, must not be NULL.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_FAILED_INIT if any callback is NULL or init failed.
+ *
+ * @warning The callbacks must stay valid until the last matching
+ *          curl_global_cleanup() has run.
  */
 CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
                               curl_free_callback f, curl_realloc_callback r,
@@ -284,7 +388,16 @@ CURLcode curl_global_init_mem(long flags, curl_malloc_callback m,
 }
 
 /**
- * curl_global_cleanup() globally cleanups curl.
+ * @brief Globally clean up libcurl.
+ *
+ * curl_global_cleanup() globally cleanups curl. Only the call that drops
+ * the reference counter to zero releases the global resources (SSH, TLS,
+ * QUIC, async resolver, Amiga, Winsock, SSPI). Calling it without a
+ * matching init is a no-op.
+ *
+ * @warning All easy and multi handles must be cleaned up before the last
+ *          call. Not thread-safe unless built with
+ *          GLOBAL_INIT_IS_THREADSAFE.
  */
 void curl_global_cleanup(void)
 {
@@ -325,7 +438,15 @@ void curl_global_cleanup(void)
 }
 
 /**
+ * @brief Configure the global logging (trace) options.
+ *
  * curl_global_trace() globally initializes curl logging.
+ *
+ * @param[in] config  Trace configuration string, e.g. "all,-http/2".
+ *
+ * @return CURLE_OK on success, or when verbose strings are disabled in
+ *         this build (the option is then ignored).
+ * @return Other CURLcode errors from parsing the configuration.
  */
 CURLcode curl_global_trace(const char *config)
 {
@@ -344,8 +465,22 @@ CURLcode curl_global_trace(const char *config)
 #endif
 }
 
-/*
+/**
+ * @brief Select the TLS backend to use, or list the available ones.
+ *
  * curl_global_sslset() globally initializes the SSL backend to use.
+ *
+ * @param[in]  id     Backend id, or CURLSSLBACKEND_NONE to select by name.
+ * @param[in]  name   Backend name, used when @p id is none; may be NULL.
+ * @param[out] avail  Optional; receives a NULL terminated list of the
+ *                    available backends. The list is owned by libcurl.
+ *
+ * @return CURLSSLSET_OK if the backend was selected.
+ * @return CURLSSLSET_UNKNOWN_BACKEND if the backend is not known.
+ * @return CURLSSLSET_TOO_LATE if a backend is already in use.
+ * @return CURLSSLSET_NO_BACKENDS if libcurl has no TLS support.
+ *
+ * @note Must be called before curl_global_init().
  */
 CURLsslset curl_global_sslset(curl_sslbackend id, const char *name,
                               const curl_ssl_backend ***avail)
@@ -361,9 +496,21 @@ CURLsslset curl_global_sslset(curl_sslbackend id, const char *name,
   return rc;
 }
 
-/*
+/**
+ * @brief Allocate and initialize a new easy handle.
+ *
  * curl_easy_init() is the external interface to alloc, setup and init an
  * easy handle that is returned. If anything goes wrong, NULL is returned.
+ * Performs a default curl_global_init() if the application has not.
+ *
+ * @return A new easy handle on success, to be released with
+ *         curl_easy_cleanup().
+ * @return NULL on failure (global init failed or out of memory).
+ *
+ * @warning The implicit global init is not thread-safe unless built with
+ *          GLOBAL_INIT_IS_THREADSAFE; call curl_global_init() explicitly
+ *          in multi-threaded programs.
+ * @see curl_easy_cleanup(), curl_easy_duphandle()
  */
 CURL *curl_easy_init(void)
 {
@@ -396,25 +543,43 @@ CURL *curl_easy_init(void)
 
 #ifdef DEBUGBUILD
 
+/**
+ * @internal
+ * @brief Debug builds: a node in the list of sockets the event based
+ *        engine monitors.
+ */
 struct socketmonitor {
-  struct socketmonitor *next; /* the next node in the list or NULL */
-  struct pollfd socket; /* socket info of what to monitor */
+  struct socketmonitor *next; /**< next node in the list or NULL */
+  struct pollfd socket; /**< socket info of what to monitor */
 };
 
+/**
+ * @internal
+ * @brief Debug builds: state of the event based transfer engine.
+ */
 struct events {
-  long ms;              /* timeout, run the timeout function when reached */
-  bool msbump;          /* set TRUE when timeout is set by callback */
-  int num_sockets;      /* number of nodes in the monitor list */
-  struct socketmonitor *list; /* list of sockets to monitor */
-  int running_handles;  /* store the returned number */
+  long ms;              /**< timeout, run timeout function when reached */
+  bool msbump;          /**< set TRUE when timeout is set by callback */
+  int num_sockets;      /**< number of nodes in the monitor list */
+  struct socketmonitor *list; /**< list of sockets to monitor */
+  int running_handles;  /**< store the returned number */
 };
 
+/** Set to 1 to print poll() related tracing from the event engine. */
 #define DEBUG_EV_POLL   0
 
-/* events_timer
+/**
+ * @internal
+ * @brief Multi timer callback of the event engine.
  *
  * Callback that gets called with a new value when the timeout should be
- * updated.
+ * updated. Stores the timeout and flags that it was bumped.
+ *
+ * @param[in]     multi       The multi handle (unused).
+ * @param[in]     timeout_ms  New timeout in milliseconds, -1 for none.
+ * @param[in,out] userp       The struct events to update.
+ *
+ * @return Always 0.
  */
 static int events_timer(CURLM *multi,    /* multi handle */
                         long timeout_ms, /* see above */
@@ -430,9 +595,13 @@ static int events_timer(CURLM *multi,    /* multi handle */
   return 0;
 }
 
-/* poll2cselect
+/**
+ * @internal
+ * @brief Convert poll() event bits to CURL_CSELECT_* bits.
  *
- * convert from poll() bit definitions to libcurl's CURL_CSELECT_* ones
+ * @param[in] pollmask  Mask of POLLIN, POLLOUT and POLLERR.
+ *
+ * @return The equivalent CURL_CSELECT_IN/OUT/ERR mask.
  */
 static int poll2cselect(int pollmask)
 {
@@ -446,9 +615,13 @@ static int poll2cselect(int pollmask)
   return omask;
 }
 
-/* socketcb2poll
+/**
+ * @internal
+ * @brief Convert CURL_POLL_* bits to poll() event bits.
  *
- * convert from libcurl' CURL_POLL_* bit definitions to poll()'s
+ * @param[in] pollmask  Mask of CURL_POLL_IN and CURL_POLL_OUT.
+ *
+ * @return The equivalent POLLIN/POLLOUT mask.
  */
 static short socketcb2poll(int pollmask)
 {
@@ -460,10 +633,21 @@ static short socketcb2poll(int pollmask)
   return omask;
 }
 
-/* events_socket
+/**
+ * @internal
+ * @brief Multi socket callback of the event engine.
  *
  * Callback that gets called with information about socket activity to
- * monitor.
+ * monitor. Adds, updates or removes the socket in the monitor list.
+ *
+ * @param[in]     easy     Easy handle the socket belongs to.
+ * @param[in]     s        The socket.
+ * @param[in]     what     CURL_POLL_IN/OUT/INOUT/REMOVE.
+ * @param[in,out] userp    The struct events holding the monitor list.
+ * @param[in]     socketp  Private socket pointer (unused).
+ *
+ * @return 0 on success.
+ * @return CURLE_OUT_OF_MEMORY if a list node could not be allocated.
  */
 static int events_socket(CURL *easy,      /* easy handle */
                          curl_socket_t s, /* socket */
@@ -539,10 +723,14 @@ static int events_socket(CURL *easy,      /* easy handle */
   return 0;
 }
 
-/*
- * events_setup()
+/**
+ * @internal
+ * @brief Install the timer and socket callbacks on the multi handle.
  *
  * Do the multi handle setups that only event-based transfers need.
+ *
+ * @param[in,out] multi  The multi handle to configure.
+ * @param[in]     ev     Event state passed as callback user data.
  */
 static void events_setup(struct Curl_multi *multi, struct events *ev)
 {
@@ -555,6 +743,15 @@ static void events_setup(struct Curl_multi *multi, struct events *ev)
   curl_multi_setopt(multi, CURLMOPT_SOCKETDATA, ev);
 }
 
+/**
+ * @internal
+ * @brief Rebuild the poll descriptor set from the monitored sockets.
+ *
+ * @param[in,out] cpfds  Poll set, reset and refilled.
+ * @param[in]     ev     Event state with the socket list.
+ *
+ * @return CURLE_OK on success, else the error from adding a socket.
+ */
 static CURLcode populate_cpfds(struct curl_pollfds *cpfds, struct events *ev)
 {
   struct socketmonitor *m;
@@ -572,6 +769,20 @@ static CURLcode populate_cpfds(struct curl_pollfds *cpfds, struct events *ev)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Wait for socket activity or the current timeout.
+ *
+ * With no sockets to watch, simply sleeps for the timeout.
+ *
+ * @param[in]  ev      Event state with the timeout.
+ * @param[in]  cpfds   Descriptors to poll.
+ * @param[out] pollrc  Result of poll(): number of ready sockets, 0 on
+ *                     timeout.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_UNRECOVERABLE_POLL if poll() failed.
+ */
 static CURLcode poll_cpfds(struct events *ev,
                            struct curl_pollfds *cpfds,
                            int *pollrc)
@@ -601,9 +812,21 @@ static CURLcode poll_cpfds(struct events *ev,
   return CURLE_OK;
 }
 
-/* wait_or_timeout()
+/**
+ * @internal
+ * @brief Drive the multi handle until a transfer completes.
  *
- * waits for activity on any of the given sockets, or the timeout to trigger.
+ * Waits for activity on any of the given sockets, or the timeout to
+ * trigger, and feeds the outcome to curl_multi_socket_action(). The
+ * timeout is decreased by the time spent unless a callback updated it.
+ *
+ * @param[in,out] multi  The multi handle with one transfer.
+ * @param[in,out] ev     Event state.
+ *
+ * @return The CURLcode of the finished transfer.
+ * @return CURLE_URL_MALFORMAT if curl_multi_socket_action() failed.
+ * @return CURLE_UNRECOVERABLE_POLL or out of memory style errors from
+ *         the polling helpers.
  */
 static CURLcode wait_or_timeout(struct Curl_multi *multi, struct events *ev)
 {
@@ -694,9 +917,16 @@ out:
   return result;
 }
 
-/* easy_events()
+/**
+ * @internal
+ * @brief Run a transfer in a blocking manner using the events-based API.
  *
- * Runs a transfer in a blocking manner using the events-based API
+ * @param[in,out] multi  The multi handle with one transfer.
+ *
+ * @return The CURLcode of the transfer, see wait_or_timeout().
+ * @warning The event state is a function-local static so it outlives the
+ *          call (needed while the handle is removed); thus this is not
+ *          thread-safe.
  */
 static CURLcode easy_events(struct Curl_multi *multi)
 {
@@ -710,10 +940,28 @@ static CURLcode easy_events(struct Curl_multi *multi)
   return wait_or_timeout(multi, &evs);
 }
 #else /* DEBUGBUILD */
-/* when not built with debug, this function does not exist */
+/**
+ * @internal
+ * @brief Release builds: the event engine does not exist, so this macro
+ *        evaluates to CURLE_NOT_BUILT_IN.
+ */
 #define easy_events(x) CURLE_NOT_BUILT_IN
 #endif
 
+/**
+ * @internal
+ * @brief Run a transfer to completion with curl_multi_poll()/perform().
+ *
+ * Loops, waiting up to one second per round, until the multi handle has
+ * no running transfers and a completion message can be read.
+ *
+ * @param[in,out] multi  The multi handle with one transfer.
+ *
+ * @return The CURLcode of the finished transfer.
+ * @return CURLE_OUT_OF_MEMORY if the multi interface ran out of memory.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT for any other multi error, which
+ *         should never happen.
+ */
 static CURLcode easy_transfer(struct Curl_multi *multi)
 {
   bool done = FALSE;
@@ -750,22 +998,41 @@ static CURLcode easy_transfer(struct Curl_multi *multi)
   return result;
 }
 
-/*
- * easy_perform() is the internal interface that performs a blocking
- * transfer as previously setup.
+/**
+ * @internal
+ * @brief Perform a blocking transfer as previously set up.
  *
- * CONCEPT: This function creates a multi handle, adds the easy handle to it,
- * runs curl_multi_perform() until the transfer is done, then detaches the
- * easy handle, destroys the multi handle and returns the easy handle's return
- * code.
+ * easy_perform() is the internal interface that performs a blocking
+ * transfer.
+ *
+ * CONCEPT: This function creates a multi handle, adds the easy handle to
+ * it, runs curl_multi_perform() until the transfer is done, then detaches
+ * the easy handle, destroys the multi handle and returns the easy
+ * handle's return code.
  *
  * REALITY: it cannot create and destroy the multi handle that easily. It
  * needs to keep it around since if this easy handle is used again by this
- * function, the same multi handle must be reused so that the same pools and
- * caches can be used.
+ * function, the same multi handle must be reused so that the same pools
+ * and caches can be used.
  *
- * DEBUG: if 'events' is set TRUE, this function will use a replacement engine
- * instead of curl_multi_perform() and use curl_multi_socket_action().
+ * DEBUG: if 'events' is set TRUE, this function will use a replacement
+ * engine instead of curl_multi_perform() and use
+ * curl_multi_socket_action().
+ *
+ * @param[in,out] data    The easy handle to run.
+ * @param[in]     events  TRUE to use the event engine (debug builds only).
+ *
+ * @return CURLE_OK if the transfer succeeded.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p data is NULL.
+ * @return CURLE_FAILED_INIT if the handle is already in a user multi
+ *         handle, or adding it to the private multi handle failed.
+ * @return CURLE_RECURSIVE_API_CALL if called from within a callback.
+ * @return CURLE_OUT_OF_MEMORY if no multi handle could be created.
+ * @return Any other CURLcode describing the transfer result.
+ *
+ * @note A leftover connect-only connection on the handle is closed first.
+ * @warning The private multi handle is owned by the easy handle
+ *          (@c data->multi_easy) and kept alive after returning.
  */
 static CURLcode easy_perform(struct Curl_easy *data, bool events)
 {
@@ -842,9 +1109,21 @@ static CURLcode easy_perform(struct Curl_easy *data, bool events)
   return result;
 }
 
-/*
+/**
+ * @brief Perform a blocking file transfer.
+ *
  * curl_easy_perform() is the external interface that performs a blocking
  * transfer as previously setup.
+ *
+ * @param[in] curl  Easy handle from curl_easy_init().
+ *
+ * @return CURLE_OK on success, otherwise a CURLcode describing the error
+ *         (see easy_perform() for the handle related ones).
+ * @return CURLE_BAD_FUNCTION_ARGUMENT for an invalid handle.
+ *
+ * @warning Must not be called from within a libcurl callback or with a
+ *          handle that is added to a multi handle.
+ * @see curl_easy_init(), curl_multi_perform()
  */
 CURLcode curl_easy_perform(CURL *curl)
 {
@@ -859,9 +1138,18 @@ CURLcode curl_easy_perform(CURL *curl)
 }
 
 #ifdef DEBUGBUILD
-/*
- * curl_easy_perform_ev() is the external interface that performs a blocking
- * transfer using the event-based API internally.
+/**
+ * @internal
+ * @brief Debug builds: perform a blocking transfer using the event-based
+ *        API internally.
+ *
+ * curl_easy_perform_ev() is the external interface that performs a
+ * blocking transfer using curl_multi_socket_action() instead of
+ * curl_multi_perform().
+ *
+ * @param[in] easy  Easy handle from curl_easy_init().
+ *
+ * @return Same values as curl_easy_perform().
  */
 CURLcode curl_easy_perform_ev(struct Curl_easy *easy)
 {
@@ -876,9 +1164,18 @@ CURLcode curl_easy_perform_ev(struct Curl_easy *easy)
 }
 #endif
 
-/*
- * curl_easy_cleanup() is the external interface to cleaning/freeing the given
- * easy handle.
+/**
+ * @brief Clean up and free an easy handle.
+ *
+ * curl_easy_cleanup() is the external interface to cleaning/freeing the
+ * given easy handle. SIGPIPE is ignored while connections are closed.
+ *
+ * @param[in] curl  Easy handle to free; NULL or invalid handles are
+ *                  ignored.
+ *
+ * @warning The handle must not be used afterwards. It must not be freed
+ *          from within a callback or while it is in a multi handle.
+ * @see curl_easy_init()
  */
 void curl_easy_cleanup(CURL *curl)
 {
@@ -894,9 +1191,22 @@ void curl_easy_cleanup(CURL *curl)
   CURL_EAPI_LEAVE(&guard);
 }
 
-/*
- * curl_easy_getinfo() is an external interface that allows an app to retrieve
- * information from a performed transfer and similar.
+/**
+ * @brief Retrieve information about a performed transfer.
+ *
+ * curl_easy_getinfo() is an external interface that allows an app to
+ * retrieve information from a performed transfer and similar.
+ *
+ * @param[in]  curl  Easy handle.
+ * @param[in]  info  The CURLINFO_* item to get.
+ * @param[out] ...   Exactly one pointer whose type depends on @p info.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_UNKNOWN_OPTION if @p info is not known.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT for an invalid handle.
+ *
+ * @warning Returned string pointers are owned by the handle and only
+ *          valid until the next transfer or until it is cleaned up.
  */
 #undef curl_easy_getinfo
 CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
@@ -920,6 +1230,24 @@ CURLcode curl_easy_getinfo(CURL *curl, CURLINFO info, ...)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Duplicate the user-set options of an easy handle.
+ *
+ * Copies @c src->set into @c dst->set, then deep copies the strings,
+ * blobs, the copied POST fields and the MIME structure so that both
+ * handles own separate memory.
+ *
+ * @param[in,out] dst  Destination handle; its set struct is overwritten.
+ * @param[in]     src  Source handle.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY if any copy failed.
+ * @return Other CURLcode from duplicating strings, blobs or MIME parts.
+ *
+ * @note On failure the destination is left in a state that the caller
+ *       can free with Curl_freeset().
+ */
 static CURLcode dupset(struct Curl_easy *dst, struct Curl_easy *src)
 {
   CURLcode result = CURLE_OK;
@@ -985,6 +1313,14 @@ static CURLcode dupset(struct Curl_easy *dst, struct Curl_easy *src)
   return result;
 }
 
+/**
+ * @internal
+ * @brief Destructor installed for the meta hash of a duplicated handle.
+ *
+ * The new handle's meta hash is empty, so this must never be called.
+ *
+ * @param[in] p  Hash entry, always NULL.
+ */
 static void dupeasy_meta_freeentry(void *p)
 {
   (void)p;
@@ -994,10 +1330,24 @@ static void dupeasy_meta_freeentry(void *p)
   DEBUGASSERT(!p);
 }
 
-/*
+/**
+ * @brief Duplicate an easy handle.
+ *
  * curl_easy_duphandle() is an external interface to allow duplication of a
- * given input easy handle. The returned handle will be a new working handle
- * with all options set exactly as the input source handle.
+ * given input easy handle. The returned handle will be a new working
+ * handle with all options set exactly as the input source handle.
+ * Cookies, alt-svc and HSTS caches are duplicated when enabled, as are
+ * the URL and referer.
+ *
+ * @param[in] curl  The easy handle to copy.
+ *
+ * @return A new easy handle, to be released with curl_easy_cleanup().
+ * @return NULL on failure or for an invalid handle.
+ *
+ * @note Live connections, the DNS cache and other transfer state are not
+ *       copied.
+ * @warning Pointers given with CURLOPT_*DATA options are copied as is, so
+ *          both handles share the pointed-to data.
  */
 CURL *curl_easy_duphandle(CURL *curl)
 {
@@ -1128,9 +1478,18 @@ fail:
   return NULL;
 }
 
-/*
- * curl_easy_reset() is an external interface that allows an app to re-
- * initialize a session handle to the default values.
+/**
+ * @brief Reset an easy handle to its initial option values.
+ *
+ * curl_easy_reset() is an external interface that allows an app to
+ * re-initialize a session handle to the default values. Options, progress
+ * data, info data and authentication state are cleared; live connections,
+ * caches and the session ID cache are kept.
+ *
+ * @param[in,out] curl  The easy handle to reset.
+ *
+ * @warning Not allowed while the handle is being used by a transfer in
+ *          another thread.
  */
 void curl_easy_reset(CURL *curl)
 {
@@ -1172,18 +1531,27 @@ void curl_easy_reset(CURL *curl)
   CURL_EAPI_LEAVE(&guard);
 }
 
-/*
+/**
+ * @brief Pause or unpause a transfer in either direction.
+ *
  * curl_easy_pause() allows an application to pause or unpause a specific
  * transfer and direction. This function sets the full new state for the
  * current connection this easy handle operates on.
  *
- * NOTE: if you have the receiving paused and you call this function to remove
- * the pausing, you may get your write callback called at this point.
+ * @param[in] curl    The easy handle.
+ * @param[in] action  Bitmask of CURLPAUSE_* bits in curl/curl.h.
  *
- * Action is a bitmask consisting of CURLPAUSE_* bits in curl/curl.h
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if the handle has no connection.
+ * @return CURLE_ABORTED_BY_CALLBACK if the application timer or socket
+ *         callback signalled an error after the state changed.
+ * @return Other CURLcode from pausing/unpausing the send or receive side.
  *
- * NOTE: This is one of few API functions that are allowed to be called from
- * within a callback.
+ * @note If you have the receiving paused and you call this function to
+ *       remove the pausing, you may get your write callback called at
+ *       this point.
+ * @note This is one of few API functions that are allowed to be called
+ *       from within a callback.
  */
 CURLcode curl_easy_pause(CURL *curl, int action)
 {
@@ -1242,6 +1610,18 @@ out:
   return result;
 }
 
+/**
+ * @internal
+ * @brief Find the connection of a connect-only handle.
+ *
+ * @param[in]  data   The easy handle.
+ * @param[out] connp  Receives the connection used last.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p data is NULL.
+ * @return CURLE_UNSUPPORTED_PROTOCOL if CURLOPT_CONNECT_ONLY is not set
+ *         or the last connection socket cannot be found.
+ */
 static CURLcode easy_connection(struct Curl_easy *data,
                                 struct connectdata **connp)
 {
@@ -1267,10 +1647,21 @@ static CURLcode easy_connection(struct Curl_easy *data,
   return CURLE_OK;
 }
 
-/*
- * Receives data from the connected socket. Use after successful
- * curl_easy_perform() with CURLOPT_CONNECT_ONLY option.
- * Returns CURLE_OK on success, error code on error.
+/**
+ * @brief Receive data from the connected socket.
+ *
+ * Use after successful curl_easy_perform() with the CURLOPT_CONNECT_ONLY
+ * option. On the first call the transfer is reattached to its connection.
+ *
+ * @param[in]  data    The easy handle.
+ * @param[out] buffer  Buffer to receive into.
+ * @param[in]  buflen  Size of @p buffer.
+ * @param[out] n       Number of bytes received.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_AGAIN if no data is available right now.
+ * @return CURLE_UNSUPPORTED_PROTOCOL if not a connect-only handle.
+ * @return Other CURLcode errors from the connection.
  */
 CURLcode Curl_easy_recv(struct Curl_easy *data,
                         void *buffer, size_t buflen, size_t *n)
@@ -1291,6 +1682,20 @@ CURLcode Curl_easy_recv(struct Curl_easy *data,
   return Curl_conn_recv(data, FIRSTSOCKET, buffer, buflen, n);
 }
 
+/**
+ * @brief Public API: receive raw data on a connect-only connection.
+ *
+ * @param[in]  curl    The easy handle.
+ * @param[out] buffer  Buffer to receive into.
+ * @param[in]  buflen  Size of @p buffer.
+ * @param[out] n       Number of bytes received.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p n is NULL or @p buffer is NULL
+ *         with a non-zero length.
+ * @return See Curl_easy_recv() for the other values.
+ * @see curl_easy_send()
+ */
 CURLcode curl_easy_recv(CURL *curl, void *buffer, size_t buflen, size_t *n)
 {
   struct Curl_eapi_guard guard;
@@ -1309,6 +1714,17 @@ out:
 }
 
 #ifndef CURL_DISABLE_WEBSOCKETS
+/**
+ * @internal
+ * @brief Attach a connect-only handle to its connection if detached.
+ *
+ * @param[in,out] data  The easy handle.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_UNSUPPORTED_PROTOCOL if not a connect-only handle or the
+ *         connection is gone.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p data is NULL.
+ */
 CURLcode Curl_connect_only_attach(struct Curl_easy *data)
 {
   CURLcode result;
@@ -1327,10 +1743,22 @@ CURLcode Curl_connect_only_attach(struct Curl_easy *data)
 }
 #endif /* !CURL_DISABLE_WEBSOCKETS */
 
-/*
- * Sends data over the connected socket.
+/**
+ * @internal
+ * @brief Send data over the connected socket.
  *
- * This is the private internal version of curl_easy_send()
+ * This is the private internal version of curl_easy_send(). SIGPIPE is
+ * suppressed during the send.
+ *
+ * @param[in,out] data    The easy handle.
+ * @param[in]     buffer  Data to send.
+ * @param[in]     buflen  Length of @p buffer.
+ * @param[out]    n       Number of bytes sent.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_AGAIN if the socket is not ready for writing.
+ * @return CURLE_SEND_ERROR for any other send failure.
+ * @return CURLE_UNSUPPORTED_PROTOCOL if not a connect-only handle.
  */
 CURLcode Curl_senddata(struct Curl_easy *data, const void *buffer,
                        size_t buflen, size_t *n)
@@ -1358,9 +1786,23 @@ CURLcode Curl_senddata(struct Curl_easy *data, const void *buffer,
   return result;
 }
 
-/*
- * Sends data over the connected socket. Use after successful
- * curl_easy_perform() with CURLOPT_CONNECT_ONLY option.
+/**
+ * @brief Send raw data over the connected socket.
+ *
+ * Use after successful curl_easy_perform() with the CURLOPT_CONNECT_ONLY
+ * option.
+ *
+ * @param[in]  curl    The easy handle.
+ * @param[in]  buffer  Data to send.
+ * @param[in]  buflen  Length of @p buffer.
+ * @param[out] n       Number of bytes sent.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p n is NULL or @p buffer is NULL
+ *         with a non-zero length.
+ * @return CURLE_AGAIN, CURLE_SEND_ERROR or CURLE_UNSUPPORTED_PROTOCOL as
+ *         described for Curl_senddata().
+ * @see curl_easy_recv()
  */
 CURLcode curl_easy_send(CURL *curl, const void *buffer, size_t buflen,
                         size_t *n)
@@ -1384,8 +1826,17 @@ out:
   return result;
 }
 
-/*
- * Performs connection upkeep for the given session handle.
+/**
+ * @brief Perform connection upkeep for the given session handle.
+ *
+ * Gives the connection pool a chance to keep connections alive, for
+ * example by sending HTTP/2 PING frames.
+ *
+ * @param[in] curl  The easy handle.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT for an invalid handle.
+ * @return Other CURLcode errors from the upkeep operations.
  */
 CURLcode curl_easy_upkeep(CURL *curl)
 {
@@ -1400,6 +1851,22 @@ CURLcode curl_easy_upkeep(CURL *curl)
   return result;
 }
 
+/**
+ * @brief Import a serialized TLS session into the session cache.
+ *
+ * @param[in] curl         The easy handle.
+ * @param[in] session_key  Cache key, or NULL to use the exported one.
+ * @param[in] shmac        HMAC of the session key data.
+ * @param[in] shmac_len    Length of @p shmac.
+ * @param[in] sdata        Serialized session data, must not be empty.
+ * @param[in] sdata_len    Length of @p sdata.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if the session data is missing.
+ * @return CURLE_NOT_BUILT_IN if TLS session export is not supported by
+ *         this build.
+ * @return Other CURLcode from the import itself.
+ */
 CURLcode curl_easy_ssls_import(CURL *curl, const char *session_key,
                                const unsigned char *shmac, size_t shmac_len,
                                const unsigned char *sdata, size_t sdata_len)
@@ -1428,6 +1895,19 @@ CURLcode curl_easy_ssls_import(CURL *curl, const char *session_key,
 #endif
 }
 
+/**
+ * @brief Export the cached TLS sessions through a callback.
+ *
+ * @param[in] curl       The easy handle.
+ * @param[in] export_fn  Callback invoked per session, must not be NULL.
+ * @param[in] userptr    Opaque pointer passed to @p export_fn.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_BAD_FUNCTION_ARGUMENT if @p export_fn is NULL.
+ * @return CURLE_NOT_BUILT_IN if TLS session export is not supported by
+ *         this build.
+ * @return Other CURLcode, including errors returned by @p export_fn.
+ */
 CURLcode curl_easy_ssls_export(CURL *curl,
                                curl_ssls_export_cb *export_fn,
                                void *userptr)
@@ -1453,6 +1933,21 @@ CURLcode curl_easy_ssls_export(CURL *curl,
 #endif
 }
 
+/**
+ * @brief Attach meta data to the easy handle under a key.
+ *
+ * The meta data is owned by the handle afterwards and freed with the
+ * given destructor when removed, replaced or when the handle goes away.
+ *
+ * @param[in,out] data       The easy handle.
+ * @param[in]     key        NUL-terminated key, copied by the hash.
+ * @param[in]     meta_data  The data, must not be NULL.
+ * @param[in]     meta_dtor  Destructor called on the data.
+ *
+ * @return CURLE_OK on success.
+ * @return CURLE_OUT_OF_MEMORY if it could not be stored; the destructor
+ *         has then already been called on @p meta_data.
+ */
 CURLcode Curl_meta_set(struct Curl_easy *data, const char *key,
                        void *meta_data, Curl_meta_dtor *meta_dtor)
 {
@@ -1465,11 +1960,26 @@ CURLcode Curl_meta_set(struct Curl_easy *data, const char *key,
   return CURLE_OK;
 }
 
+/**
+ * @brief Remove (and destroy) the meta data stored under a key.
+ *
+ * @param[in,out] data  The easy handle.
+ * @param[in]     key   NUL-terminated key; a missing key is ignored.
+ */
 void Curl_meta_remove(struct Curl_easy *data, const char *key)
 {
   Curl_hash_delete(&data->meta_hash, key, strlen(key) + 1);
 }
 
+/**
+ * @brief Look up meta data stored under a key.
+ *
+ * @param[in] data  The easy handle.
+ * @param[in] key   NUL-terminated key.
+ *
+ * @return The stored pointer, or NULL if there is none.
+ * @warning The data stays owned by the handle.
+ */
 void *Curl_meta_get(struct Curl_easy *data, const char *key)
 {
   return Curl_hash_pick(&data->meta_hash, key, strlen(key) + 1);
@@ -1479,3 +1989,5 @@ void Curl_meta_reset(struct Curl_easy *data)
 {
   Curl_hash_clean(&data->meta_hash);
 }
+
+/** @} */
